@@ -139,7 +139,8 @@ async function startMockUpstream(port, {
   forceJsonForStream = false,
   omitSessionStart = false,
   forceStatus = null,
-  forceBusinessError = false
+  forceBusinessError = false,
+  streamDelayAfterFirstDeltaMs = 0
 } = {}) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
@@ -188,10 +189,17 @@ async function startMockUpstream(port, {
             })}\n\n`);
           }
           res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'mocked ' })}\n\n`);
-          res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'stream answer' })}\n\n`);
-          res.write(`data: ${JSON.stringify({ type: 'finish' })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
+          const writeRest = () => {
+            res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'stream answer' })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'finish' })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+          };
+          if (streamDelayAfterFirstDeltaMs > 0) {
+            setTimeout(writeRest, streamDelayAfterFirstDeltaMs);
+          } else {
+            writeRest();
+          }
           return;
         }
 
@@ -478,6 +486,55 @@ test('POST /v1/chat/completions stream=true keeps DONE after chunks when upstrea
   assert.ok(firstChunkIndex >= 0, `missing completion chunk in stream body: ${body}`);
   assert.ok(doneIndex > firstChunkIndex, `DONE must appear after completion chunks: ${body}`);
   assert.equal((body.match(/data: \[DONE\]/g) || []).length, 1);
+});
+
+test('POST /v1/chat/completions stream=true flushes first chunk before stream end when no session metadata', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    omitSessionStart: true,
+    streamDelayAfterFirstDeltaMs: 450
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const startedAt = Date.now();
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      messages: [{ role: 'user', content: 'ensure first chunk is not buffered to end' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers.get('content-type') || ''), /text\/event-stream/i);
+
+  const reader = res.body.getReader();
+  let streamText = '';
+  let firstChunkAt = null;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    streamText += Buffer.from(value).toString('utf8');
+    if (!firstChunkAt && streamText.includes('chat.completion.chunk')) {
+      firstChunkAt = Date.now();
+    }
+  }
+
+  assert.ok(firstChunkAt !== null, `expected first chunk in stream body, got: ${streamText}`);
+  assert.ok((firstChunkAt - startedAt) < 350, `first chunk should arrive before delayed finish: ${firstChunkAt - startedAt}ms`);
+  assert.match(streamText, /data: \[DONE\]/);
 });
 
 test('POST /v1/chat/completions maps upstream non-2xx to OpenAI error envelope', async (t) => {

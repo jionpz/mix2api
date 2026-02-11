@@ -2098,8 +2098,10 @@ async function handleChatCompletion(req, res) {
             if (openaiChunk) {
               const payload = `data: ${JSON.stringify(openaiChunk)}\n\n`;
               if (!sentAny && !capturedSessionId) {
-                // 还没拿到 sessionId，先缓存
+                // 还没拿到 sessionId 时先缓存；但为了保证增量可实时消费，
+                // 一旦出现首个可发送 chunk（通常是 text-delta）立即刷出，避免等到流结束。
                 pendingChunks.push(payload);
+                flushPending();
               } else {
                 if (!sentAny) flushPending();
                 res.write(payload);
