@@ -51,6 +51,10 @@ node server.js
 - 与 `new-api` 集成时建议：
   - `INBOUND_AUTH_MODE=bearer` + `INBOUND_BEARER_TOKEN=<channel key>`（只允许 new-api 调用）
   - `UPSTREAM_AUTH_MODE=static` + `UPSTREAM_BEARER_TOKEN=<上游 token>`（上游鉴权与入站解耦）
+- 如需由适配器托管上游登录态：
+  - `UPSTREAM_AUTH_MODE=managed`
+  - 配置 `UPSTREAM_TOKEN_URL`（或 `UPSTREAM_TOKEN_PATH`）及可选 `UPSTREAM_TOKEN_BODY_JSON`
+  - 当上游返回鉴权失效（如 401/403 或 token expired 错误）时，适配器会自动刷新 token 并重试一次
 
 更多设计细节见：
 

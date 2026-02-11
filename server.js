@@ -54,11 +54,31 @@ function envBool(name, fallback) {
   return raw === '1' || raw.toLowerCase() === 'true' || raw.toLowerCase() === 'yes';
 }
 
+function envJson(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  try {
+    return JSON.parse(String(raw));
+  } catch {
+    console.warn(`⚠ Invalid JSON in ${name}, fallback to default value`);
+    return fallback;
+  }
+}
+
 function redactHeaders(headers) {
   const out = { ...headers };
   if (out.authorization) out.authorization = 'Bearer ***';
   if (out['proxy-authorization']) out['proxy-authorization'] = '***';
   return out;
+}
+
+function redactSensitiveText(text) {
+  if (text === undefined || text === null) return '';
+  let output = String(text);
+  output = output.replace(/\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b/gi, 'Bearer ***');
+  output = output.replace(/("?(access_?token|refresh_?token|id_?token|token)"?\s*[:=]\s*")([^"]*)"/gi, '$1***"');
+  output = output.replace(/\b(token=)[^&\s]+/gi, '$1***');
+  return output;
 }
 
 function base64UrlToJson(b64url) {
@@ -109,6 +129,16 @@ const UPSTREAM_REFERER = String(process.env.UPSTREAM_REFERER || '').trim();
 const UPSTREAM_ACCEPT_LANGUAGE = String(process.env.UPSTREAM_ACCEPT_LANGUAGE || 'zh-CN,zh;q=0.9,en;q=0.8').trim();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_MODEL_IDS = ['mix/qwen-3-235b-instruct', 'mix/claude-sonnet-4-5'];
+const UPSTREAM_TOKEN_URL = String(process.env.UPSTREAM_TOKEN_URL || '').trim();
+const UPSTREAM_TOKEN_PATH = String(process.env.UPSTREAM_TOKEN_PATH || '/v2/token').trim();
+const UPSTREAM_TOKEN_METHOD = String(process.env.UPSTREAM_TOKEN_METHOD || 'POST').trim().toUpperCase();
+const UPSTREAM_TOKEN_HEADERS_JSON = envJson('UPSTREAM_TOKEN_HEADERS_JSON', {});
+const UPSTREAM_TOKEN_BODY_JSON = envJson('UPSTREAM_TOKEN_BODY_JSON', null);
+const UPSTREAM_TOKEN_FIELD = String(process.env.UPSTREAM_TOKEN_FIELD || 'access_token').trim();
+const UPSTREAM_TOKEN_EXPIRES_IN_FIELD = String(process.env.UPSTREAM_TOKEN_EXPIRES_IN_FIELD || 'expires_in').trim();
+const UPSTREAM_TOKEN_TIMEOUT_MS = envInt('UPSTREAM_TOKEN_TIMEOUT_MS', 10000);
+const UPSTREAM_TOKEN_EXPIRY_SKEW_MS = envInt('UPSTREAM_TOKEN_EXPIRY_SKEW_MS', 60_000);
+const UPSTREAM_AUTH_RECOVERY_RETRY = envInt('UPSTREAM_AUTH_RECOVERY_RETRY', 1);
 
 // ===== Session Store =====
 // 上游会话管理：
@@ -152,6 +182,201 @@ function fingerprint(input) {
   if (input === undefined || input === null) return 'none';
   const s = String(input);
   return crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
+}
+
+const managedUpstreamTokenState = {
+  token: null,
+  expiresAt: 0,
+  refreshPromise: null
+};
+
+function resolveUpstreamTokenEndpoint() {
+  if (UPSTREAM_TOKEN_URL) return UPSTREAM_TOKEN_URL;
+  if (!UPSTREAM_API_BASE) return '';
+  const base = UPSTREAM_API_BASE.replace(/\/+$/, '');
+  const path = UPSTREAM_TOKEN_PATH ? `/${UPSTREAM_TOKEN_PATH.replace(/^\/+/, '')}` : '';
+  return `${base}${path}`;
+}
+
+function resolveTokenExpireAtMs(token, payload) {
+  if (payload && payload[UPSTREAM_TOKEN_EXPIRES_IN_FIELD] !== undefined) {
+    const raw = Number(payload[UPSTREAM_TOKEN_EXPIRES_IN_FIELD]);
+    if (Number.isFinite(raw) && raw > 0) {
+      return Date.now() + (raw * 1000);
+    }
+  }
+  if (payload && payload.expires_in !== undefined) {
+    const raw = Number(payload.expires_in);
+    if (Number.isFinite(raw) && raw > 0) {
+      return Date.now() + (raw * 1000);
+    }
+  }
+  if (payload && payload.expiresAt !== undefined) {
+    const raw = Number(payload.expiresAt);
+    if (Number.isFinite(raw) && raw > Date.now()) {
+      return raw;
+    }
+  }
+  if (payload && payload.exp !== undefined) {
+    const raw = Number(payload.exp);
+    if (Number.isFinite(raw) && raw > 0) {
+      return raw * 1000;
+    }
+  }
+  const parts = String(token || '').split('.');
+  if (parts.length === 3) {
+    const jwtPayload = base64UrlToJson(parts[1]);
+    if (jwtPayload && Number.isFinite(Number(jwtPayload.exp))) {
+      return Number(jwtPayload.exp) * 1000;
+    }
+  }
+  return 0;
+}
+
+function isManagedTokenUsable() {
+  const token = managedUpstreamTokenState.token;
+  const expiresAt = managedUpstreamTokenState.expiresAt;
+  if (!token) return false;
+  if (!expiresAt || expiresAt <= 0) return true;
+  return (Date.now() + UPSTREAM_TOKEN_EXPIRY_SKEW_MS) < expiresAt;
+}
+
+function clearManagedUpstreamToken(reason, requestId) {
+  if (!managedUpstreamTokenState.token) return;
+  const fp = fingerprint(managedUpstreamTokenState.token);
+  managedUpstreamTokenState.token = null;
+  managedUpstreamTokenState.expiresAt = 0;
+  console.warn(`[${requestId}] 🔁 Clear managed upstream token (reason=${reason}, fp=${fp})`);
+}
+
+async function requestManagedUpstreamToken(requestId) {
+  const endpoint = resolveUpstreamTokenEndpoint();
+  if (!endpoint) {
+    throw new Error('Invalid server config: managed upstream auth requires UPSTREAM_TOKEN_URL or UPSTREAM_TOKEN_PATH');
+  }
+
+  const method = UPSTREAM_TOKEN_METHOD || 'POST';
+  const extraHeaders = (
+    UPSTREAM_TOKEN_HEADERS_JSON
+    && typeof UPSTREAM_TOKEN_HEADERS_JSON === 'object'
+    && !Array.isArray(UPSTREAM_TOKEN_HEADERS_JSON)
+  ) ? UPSTREAM_TOKEN_HEADERS_JSON : {};
+  const headers = {
+    accept: 'application/json',
+    ...extraHeaders
+  };
+  let body;
+  if (UPSTREAM_TOKEN_BODY_JSON !== null && UPSTREAM_TOKEN_BODY_JSON !== undefined) {
+    if (typeof UPSTREAM_TOKEN_BODY_JSON === 'string') {
+      body = UPSTREAM_TOKEN_BODY_JSON;
+    } else {
+      body = JSON.stringify(UPSTREAM_TOKEN_BODY_JSON);
+      if (!headers['content-type'] && !headers['Content-Type']) {
+        headers['content-type'] = 'application/json';
+      }
+    }
+  }
+
+  const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), UPSTREAM_TOKEN_TIMEOUT_MS) : null;
+  try {
+    const { httpAgent, httpsAgent } = UPSTREAM_AGENTS;
+    const response = await fetch(endpoint, {
+      method,
+      headers,
+      body,
+      agent: (parsedUrl) => (parsedUrl && parsedUrl.protocol === 'http:' ? httpAgent : httpsAgent),
+      signal: controller ? controller.signal : undefined
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const safeError = redactSensitiveText(errorText).slice(0, 300);
+      throw new Error(`Upstream token request failed: ${response.status} ${response.statusText || ''} ${safeError}`.trim());
+    }
+
+    let payload = null;
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+      payload = await response.json();
+    } else {
+      const text = await response.text();
+      payload = text ? JSON.parse(text) : null;
+    }
+
+    const token = payload && (
+      payload[UPSTREAM_TOKEN_FIELD]
+      || payload.access_token
+      || payload.token
+      || payload.id_token
+    );
+    if (!token || typeof token !== 'string') {
+      throw new Error(`Upstream token response missing token field: ${UPSTREAM_TOKEN_FIELD}`);
+    }
+
+    const expiresAt = resolveTokenExpireAtMs(token, payload);
+    managedUpstreamTokenState.token = token;
+    managedUpstreamTokenState.expiresAt = expiresAt;
+    const expiresAtText = expiresAt > 0 ? new Date(expiresAt).toISOString() : 'unknown';
+    console.log(`[${requestId}] 🔐 Managed upstream token refreshed (fp=${fingerprint(token)}, expiresAt=${expiresAtText})`);
+    return token;
+  } catch (err) {
+    const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+    throw new Error(`Managed upstream token fetch failed: ${safeMessage}`);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function getManagedUpstreamToken({ requestId, forceRefresh = false }) {
+  if (!forceRefresh && isManagedTokenUsable()) {
+    return managedUpstreamTokenState.token;
+  }
+
+  if (!forceRefresh && managedUpstreamTokenState.refreshPromise) {
+    return managedUpstreamTokenState.refreshPromise;
+  }
+
+  const refreshPromise = requestManagedUpstreamToken(requestId);
+  managedUpstreamTokenState.refreshPromise = refreshPromise;
+  try {
+    return await refreshPromise;
+  } finally {
+    if (managedUpstreamTokenState.refreshPromise === refreshPromise) {
+      managedUpstreamTokenState.refreshPromise = null;
+    }
+  }
+}
+
+function isLikelyTokenInvalidMessage(message) {
+  if (!message) return false;
+  const lower = String(message).toLowerCase();
+  if (!lower) return false;
+  return (
+    lower.includes('token expired')
+    || lower.includes('token invalid')
+    || lower.includes('invalid token')
+    || lower.includes('unauthorized')
+    || lower.includes('forbidden')
+    || lower.includes('authentication failed')
+    || lower.includes('jwt expired')
+  );
+}
+
+async function shouldRecoverManagedTokenFromResponse(response) {
+  if (!response) return false;
+  if (response.status === 401 || response.status === 403) return true;
+
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.includes('application/json')) return false;
+
+  try {
+    const payload = await response.clone().json();
+    const upstreamError = extractErrorFromUpstreamResponse(payload);
+    return isLikelyTokenInvalidMessage(upstreamError);
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeKeyPart(value, fallback = 'unknown') {
@@ -1257,7 +1482,7 @@ async function handleChatCompletion(req, res) {
     const openaiRequest = req.body;
     const authHeader = req.headers['authorization'];
     const inboundAuthMode = String(process.env.INBOUND_AUTH_MODE || 'bearer').toLowerCase(); // bearer | none
-    const upstreamAuthMode = String(process.env.UPSTREAM_AUTH_MODE || 'pass_through').toLowerCase(); // pass_through | static | none
+    const upstreamAuthMode = String(process.env.UPSTREAM_AUTH_MODE || 'pass_through').toLowerCase(); // pass_through | static | managed | none
     const expectedInboundToken = process.env.INBOUND_BEARER_TOKEN || null;
     const staticUpstreamToken = process.env.UPSTREAM_BEARER_TOKEN || null;
 
@@ -1298,38 +1523,6 @@ async function handleChatCompletion(req, res) {
       }
     }
 
-    let upstreamToken = null;
-    if (upstreamAuthMode === 'pass_through') {
-      if (!inboundToken) {
-        return sendOpenAIError(res, 500, {
-          message: 'Invalid server config: UPSTREAM_AUTH_MODE=pass_through requires inbound Bearer token',
-          type: 'server_error',
-          code: 'invalid_server_config',
-          param: 'UPSTREAM_AUTH_MODE'
-        });
-      }
-      upstreamToken = inboundToken;
-    } else if (upstreamAuthMode === 'static') {
-      if (!staticUpstreamToken) {
-        return sendOpenAIError(res, 500, {
-          message: 'Invalid server config: UPSTREAM_AUTH_MODE=static requires UPSTREAM_BEARER_TOKEN',
-          type: 'server_error',
-          code: 'invalid_server_config',
-          param: 'UPSTREAM_BEARER_TOKEN'
-        });
-      }
-      upstreamToken = staticUpstreamToken;
-    } else if (upstreamAuthMode === 'none') {
-      upstreamToken = null;
-    } else {
-      return sendOpenAIError(res, 500, {
-        message: `Invalid UPSTREAM_AUTH_MODE: ${upstreamAuthMode}`,
-        type: 'server_error',
-        code: 'invalid_server_config',
-        param: 'UPSTREAM_AUTH_MODE'
-      });
-    }
-
     // 基本请求校验（避免后续 NPE）
     if (!openaiRequest || typeof openaiRequest !== 'object') {
       return sendOpenAIError(res, 400, {
@@ -1353,6 +1546,49 @@ async function handleChatCompletion(req, res) {
         type: 'invalid_request_error',
         code: 'invalid_request',
         param: 'messages'
+      });
+    }
+
+    let upstreamToken = null;
+    if (upstreamAuthMode === 'pass_through') {
+      if (!inboundToken) {
+        return sendOpenAIError(res, 500, {
+          message: 'Invalid server config: UPSTREAM_AUTH_MODE=pass_through requires inbound Bearer token',
+          type: 'server_error',
+          code: 'invalid_server_config',
+          param: 'UPSTREAM_AUTH_MODE'
+        });
+      }
+      upstreamToken = inboundToken;
+    } else if (upstreamAuthMode === 'static') {
+      if (!staticUpstreamToken) {
+        return sendOpenAIError(res, 500, {
+          message: 'Invalid server config: UPSTREAM_AUTH_MODE=static requires UPSTREAM_BEARER_TOKEN',
+          type: 'server_error',
+          code: 'invalid_server_config',
+          param: 'UPSTREAM_BEARER_TOKEN'
+        });
+      }
+      upstreamToken = staticUpstreamToken;
+    } else if (upstreamAuthMode === 'managed') {
+      try {
+        upstreamToken = await getManagedUpstreamToken({ requestId, forceRefresh: false });
+      } catch (error) {
+        return sendOpenAIError(res, 502, {
+          message: error && error.message ? error.message : 'Failed to obtain upstream token',
+          type: 'api_error',
+          code: 'upstream_auth_error',
+          param: null
+        });
+      }
+    } else if (upstreamAuthMode === 'none') {
+      upstreamToken = null;
+    } else {
+      return sendOpenAIError(res, 500, {
+        message: `Invalid UPSTREAM_AUTH_MODE: ${upstreamAuthMode}`,
+        type: 'server_error',
+        code: 'invalid_server_config',
+        param: 'UPSTREAM_AUTH_MODE'
       });
     }
     
@@ -1498,14 +1734,41 @@ async function handleChatCompletion(req, res) {
         }
       }
     }
+
+    async function fetchUpstreamWithAuthRecovery() {
+      let authRecoveryAttempt = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const response = await upstreamFetchWithRetry();
+        if (upstreamAuthMode !== 'managed' || authRecoveryAttempt >= UPSTREAM_AUTH_RECOVERY_RETRY) {
+          return response;
+        }
+
+        const shouldRecover = await shouldRecoverManagedTokenFromResponse(response);
+        if (!shouldRecover) {
+          return response;
+        }
+
+        authRecoveryAttempt++;
+        clearManagedUpstreamToken('upstream_auth_error', requestId);
+        try {
+          upstreamToken = await getManagedUpstreamToken({ requestId, forceRefresh: true });
+        } catch (error) {
+          const safeMessage = redactSensitiveText(error && error.message ? error.message : String(error));
+          console.error(`[${requestId}] Managed token recovery failed: ${safeMessage}`);
+          return response;
+        }
+        console.warn(`[${requestId}] Retrying upstream request after managed token recovery (${authRecoveryAttempt}/${UPSTREAM_AUTH_RECOVERY_RETRY})`);
+      }
+    }
     
     // 调用上游
-    const response = await upstreamFetchWithRetry();
+    const response = await fetchUpstreamWithAuthRecovery();
     console.log(`[${requestId}] Upstream Response: status=${response.status}, content-type=${response.headers.get('content-type')}`);
     
     if (!response.ok) {
       const error = await response.text();
-      console.error(`[${requestId}] Upstream API Error:`, error);
+      console.error(`[${requestId}] Upstream API Error:`, redactSensitiveText(error));
       return sendOpenAIError(res, response.status, {
         message: `Upstream API error: ${response.statusText || response.status}`,
         type: 'api_error',
@@ -1634,9 +1897,10 @@ async function handleChatCompletion(req, res) {
         console.log(`[${requestId}] 🔍 Upstream non-stream response:`, JSON.stringify(data, null, 2));
         const upstreamError = extractErrorFromUpstreamResponse(data);
         if (upstreamError) {
-          console.error(`[${requestId}] ❌ Upstream error:`, upstreamError);
+          const safeUpstreamError = redactSensitiveText(upstreamError);
+          console.error(`[${requestId}] ❌ Upstream error:`, safeUpstreamError);
           return sendOpenAIError(res, 502, {
-            message: `Upstream error: ${upstreamError}`,
+            message: `Upstream error: ${safeUpstreamError}`,
             type: 'api_error',
             code: 'upstream_error',
             param: null
@@ -1825,10 +2089,11 @@ async function handleChatCompletion(req, res) {
       });
     }
 
-    console.error('Adapter error:', error);
+    const safeError = redactSensitiveText(error && error.message ? error.message : String(error));
+    console.error('Adapter error:', safeError);
     const expose = envBool('EXPOSE_STACK', false);
     return sendOpenAIError(res, 500, {
-      message: error && error.message ? error.message : 'Internal server error',
+      message: safeError || 'Internal server error',
       type: 'server_error',
       code: 'internal_server_error',
       param: null,

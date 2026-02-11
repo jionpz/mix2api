@@ -141,27 +141,115 @@ async function startMockUpstream(port, {
   return { server, requests };
 }
 
+async function startMockUpstreamWithManagedAuth(port, {
+  issuedTokens = ['managed-token'],
+  invalidTokens = [],
+  authErrorStatus = 401,
+  authErrorMessage = 'token expired'
+} = {}) {
+  const requests = [];
+  const invalidTokenSet = new Set(invalidTokens);
+  let issueIndex = 0;
+
+  const server = http.createServer(async (req, res) => {
+    let bodyText = '';
+    req.on('data', (chunk) => {
+      bodyText += chunk.toString('utf8');
+    });
+    req.on('end', () => {
+      let parsedBody = null;
+      try {
+        parsedBody = bodyText ? JSON.parse(bodyText) : null;
+      } catch {
+        parsedBody = null;
+      }
+
+      requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        bodyText,
+        body: parsedBody
+      });
+
+      if (req.method === 'POST' && req.url === '/v2/token') {
+        const token = issuedTokens[Math.min(issueIndex, issuedTokens.length - 1)] || 'managed-token';
+        issueIndex += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          access_token: token,
+          expires_in: 3600
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v2/chats') {
+        const m = String(req.headers.authorization || '').match(/^\s*Bearer\s+(.+)\s*$/i);
+        const token = m ? m[1] : null;
+        if (!token || invalidTokenSet.has(token)) {
+          res.writeHead(authErrorStatus, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            error: {
+              message: authErrorMessage
+            }
+          }));
+          return;
+        }
+
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          content: 'mocked upstream answer',
+          messageMetadata: {
+            sessionId: 'sess-json',
+            exchangeId: 'ex-json'
+          }
+        }));
+        return;
+      }
+
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+  });
+
+  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return { server, requests };
+}
+
 async function closeServer(server) {
   if (!server || !server.listening) return;
   await new Promise((resolve) => server.close(resolve));
 }
 
-async function startAdapter({ port, upstreamPort }) {
+async function startAdapter({ port, upstreamPort, env: envOverrides = {}, collectLogs = false }) {
   const entry = path.resolve('server.js');
+  const env = {
+    ...process.env,
+    PORT: String(port),
+    UPSTREAM_API_BASE: `http://127.0.0.1:${upstreamPort}`,
+    UPSTREAM_CHAT_PATH: '/v2/chats',
+    INBOUND_AUTH_MODE: 'bearer',
+    INBOUND_BEARER_TOKEN: 'inbound-test-token',
+    UPSTREAM_AUTH_MODE: 'none',
+    LOG_HEADERS: 'false',
+    LOG_BODIES: 'false',
+    ...envOverrides
+  };
   const proc = spawn(process.execPath, [entry], {
-    env: {
-      ...process.env,
-      PORT: String(port),
-      UPSTREAM_API_BASE: `http://127.0.0.1:${upstreamPort}`,
-      UPSTREAM_CHAT_PATH: '/v2/chats',
-      INBOUND_AUTH_MODE: 'bearer',
-      INBOUND_BEARER_TOKEN: 'inbound-test-token',
-      UPSTREAM_AUTH_MODE: 'none',
-      LOG_HEADERS: 'false',
-      LOG_BODIES: 'false'
-    },
+    env,
     stdio: ['ignore', 'pipe', 'pipe']
   });
+
+  if (collectLogs) {
+    proc.__stdout = '';
+    proc.__stderr = '';
+    proc.stdout.on('data', (chunk) => {
+      proc.__stdout += chunk.toString('utf8');
+    });
+    proc.stderr.on('data', (chunk) => {
+      proc.__stderr += chunk.toString('utf8');
+    });
+  }
 
   await waitForHealthy({ port, timeoutMs: 5000 });
   return proc;
@@ -762,4 +850,106 @@ test('POST /v1/chat/completions isolates auto-session by auth+model+client key',
   assert.equal(requests[1].body?.session_id, undefined);
   // 第 3 次请求（OpenCode）应复用第 1 次写入的 session（mock upstream 返回 sess-json）
   assert.equal(requests[2].body?.session_id, 'sess-json');
+});
+
+test('POST /v1/chat/completions with managed auth fetches upstream token when cache is empty', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const issuedToken = 'managed-token-secret-a';
+  const { server: upstreamServer, requests } = await startMockUpstreamWithManagedAuth(upstreamPort, {
+    issuedTokens: [issuedToken]
+  });
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      UPSTREAM_AUTH_MODE: 'managed',
+      UPSTREAM_TOKEN_URL: `http://127.0.0.1:${upstreamPort}/v2/token`,
+      UPSTREAM_TOKEN_BODY_JSON: JSON.stringify({ grant_type: 'client_credentials' })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'managed auth token fetch' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const tokenRequests = requests.filter((item) => item.url === '/v2/token');
+  const chatRequests = requests.filter((item) => item.url === '/v2/chats');
+  assert.equal(tokenRequests.length, 1);
+  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests[0].headers.authorization, `Bearer ${issuedToken}`);
+  assert.equal(tokenRequests[0].body?.grant_type, 'client_credentials');
+
+  await sleep(50);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.equal(logs.includes(issuedToken), false);
+});
+
+test('POST /v1/chat/completions with managed auth refreshes token and retries after auth failure', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const expiredToken = 'managed-token-expired-secret';
+  const freshToken = 'managed-token-fresh-secret';
+  const { server: upstreamServer, requests } = await startMockUpstreamWithManagedAuth(upstreamPort, {
+    issuedTokens: [expiredToken, freshToken],
+    invalidTokens: [expiredToken],
+    authErrorMessage: 'token expired'
+  });
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      UPSTREAM_AUTH_MODE: 'managed',
+      UPSTREAM_TOKEN_URL: `http://127.0.0.1:${upstreamPort}/v2/token`
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'managed auth refresh retry' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 4);
+  assert.equal(requests[0].url, '/v2/token');
+  assert.equal(requests[1].url, '/v2/chats');
+  assert.equal(requests[2].url, '/v2/token');
+  assert.equal(requests[3].url, '/v2/chats');
+  assert.equal(requests[1].headers.authorization, `Bearer ${expiredToken}`);
+  assert.equal(requests[3].headers.authorization, `Bearer ${freshToken}`);
+
+  await sleep(50);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.equal(logs.includes(expiredToken), false);
+  assert.equal(logs.includes(freshToken), false);
 });

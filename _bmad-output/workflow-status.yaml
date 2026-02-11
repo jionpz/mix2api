@@ -31,6 +31,7 @@ outputs:
   story_1_3: '_bmad-output/implementation-artifacts/1-3-流式开关路由与根路径兼容入口.md'
   story_1_4: '_bmad-output/implementation-artifacts/1-4-模型探测与健康检查端点.md'
   story_2_1: '_bmad-output/implementation-artifacts/2-1-会话隔离键与显式会话输入支持.md'
+  story_2_2: '_bmad-output/implementation-artifacts/2-2-上游-token-生命周期管理.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -55,3 +56,5 @@ notes:
   - 'Created Story 2.1 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 2.1 and moved it to review on 2026-02-11.'
   - 'Story 2.1 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 2.2 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 2.2 and moved it to review on 2026-02-11.'
