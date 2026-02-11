@@ -142,7 +142,8 @@ async function startMockUpstream(port, {
   forceBusinessError = false,
   streamDelayAfterFirstDeltaMs = 0,
   delayBeforeAnyResponseMs = 0,
-  forceStreamDropAfterFirstDelta = false
+  forceStreamDropAfterFirstDelta = false,
+  nonStreamContent = 'mocked upstream answer'
 } = {}) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
@@ -212,7 +213,7 @@ async function startMockUpstream(port, {
 
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
-            content: 'mocked upstream answer',
+            content: nonStreamContent,
             messageMetadata: {
               sessionId: 'sess-json',
               exchangeId: 'ex-json'
@@ -1501,6 +1502,134 @@ test('POST /v1/chat/completions maps legacy functions/function_call to tools com
     type: 'function',
     function: { name: 'get_weather' }
   });
+});
+
+test('POST /v1/chat/completions returns unique tool_call ids for multiple tool calls (non-stream)', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: JSON.stringify({
+      tool_calls: [
+        { name: 'read_file', arguments: { path: 'README.md' } },
+        { name: 'list_files', arguments: { path: 'src' } }
+      ]
+    })
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'list_files',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: 'read README and list src files' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].finish_reason, 'tool_calls');
+  assert.equal(json.choices[0].message.content, null);
+  assert.equal(Array.isArray(json.choices[0].message.tool_calls), true);
+  assert.equal(json.choices[0].message.tool_calls.length, 2);
+  assert.equal(json.choices[0].message.tool_calls[0].function.name, 'read_file');
+  assert.equal(json.choices[0].message.tool_calls[1].function.name, 'list_files');
+  assert.ok(/^call_/.test(json.choices[0].message.tool_calls[0].id));
+  assert.ok(/^call_/.test(json.choices[0].message.tool_calls[1].id));
+  assert.notEqual(json.choices[0].message.tool_calls[0].id, json.choices[0].message.tool_calls[1].id);
+});
+
+test('POST /v1/chat/completions stream tool_calls keep unique ids when upstream ids conflict', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: JSON.stringify({
+      tool_calls: [
+        { id: 'legacy-1', name: 'read_file', arguments: { path: 'README.md' } },
+        { id: 'legacy-1', name: 'grep_code', arguments: { pattern: 'TODO' } }
+      ]
+    })
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'grep_code',
+            parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: 'read and grep code' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers.get('content-type') || ''), /text\/event-stream/i);
+
+  const body = await res.text();
+  const chunks = body
+    .split('\n')
+    .filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+    .map((line) => JSON.parse(line.slice(6)));
+  const toolChunk = chunks.find((chunk) => Array.isArray(chunk?.choices?.[0]?.delta?.tool_calls));
+  assert.ok(toolChunk, `expected tool_calls chunk, got: ${body}`);
+  const toolCalls = toolChunk.choices[0].delta.tool_calls;
+  assert.equal(toolCalls.length, 2);
+  assert.equal(toolCalls[0].function.name, 'read_file');
+  assert.equal(toolCalls[1].function.name, 'grep_code');
+  assert.equal(toolCalls[0].id, 'call_legacy-1');
+  assert.ok(/^call_/.test(toolCalls[1].id));
+  assert.notEqual(toolCalls[0].id, toolCalls[1].id);
+  assert.match(body, /"finish_reason":"tool_calls"/);
+  assert.match(body, /data: \[DONE\]/);
 });
 
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {

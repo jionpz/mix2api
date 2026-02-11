@@ -39,6 +39,7 @@ outputs:
   story_3_3: '_bmad-output/implementation-artifacts/3-3-流式终止分型与-end-reason-归因.md'
   story_3_4: '_bmad-output/implementation-artifacts/3-4-按-client-stream-tools-维度的指标统计.md'
   story_4_1: '_bmad-output/implementation-artifacts/4-1-tools-与-legacy-functions-入参兼容.md'
+  story_4_2: '_bmad-output/implementation-artifacts/4-2-tool-calls-输出与-tool-call-id-一致性.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -87,3 +88,5 @@ notes:
   - 'Created Story 4.1 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 4.1 and moved it to review on 2026-02-11.'
   - 'Story 4.1 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 4.2 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 4.2 and moved it to review on 2026-02-11.'

@@ -1601,11 +1601,40 @@ function normalizeToolCallArguments(toolCalls) {
   });
 }
 
+function normalizeToolCallId(rawId) {
+  if (typeof rawId !== 'string') return null;
+  const trimmed = rawId.trim();
+  if (!trimmed) return null;
+  const safe = trimmed.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safe) return null;
+  return safe.startsWith('call_') ? safe : `call_${safe}`;
+}
+
+function attachStableToolCallIds(toolCalls) {
+  if (!Array.isArray(toolCalls)) return [];
+  const seen = new Set();
+  return toolCalls
+    .filter((call) => call && typeof call === 'object' && typeof call.name === 'string' && call.name)
+    .map((call) => {
+      const preferredId = normalizeToolCallId(call.id || call.tool_call_id || call.toolCallId);
+      let resolvedId = preferredId || `call_${uuidv4()}`;
+      while (seen.has(resolvedId)) {
+        resolvedId = `call_${uuidv4()}`;
+      }
+      seen.add(resolvedId);
+      return {
+        ...call,
+        id: resolvedId
+      };
+    });
+}
+
 function toOpenAIToolCallsForChunk(toolCalls) {
   // OpenAI 的 chunk delta 里 tool_calls 元素通常包含 index
-  return toolCalls.map((call, index) => ({
+  const callsWithIds = attachStableToolCallIds(toolCalls);
+  return callsWithIds.map((call, index) => ({
     index,
-    id: `call_${uuidv4()}`,
+    id: call.id,
     type: 'function',
     function: {
       name: call.name,
@@ -1616,8 +1645,9 @@ function toOpenAIToolCallsForChunk(toolCalls) {
 
 function toOpenAIToolCallsForMessage(toolCalls) {
   // 非流式最终消息体里一般不需要 index 字段（部分客户端对未知字段更敏感）
-  return toolCalls.map((call) => ({
-    id: `call_${uuidv4()}`,
+  const callsWithIds = attachStableToolCallIds(toolCalls);
+  return callsWithIds.map((call) => ({
+    id: call.id,
     type: 'function',
     function: {
       name: call.name,
