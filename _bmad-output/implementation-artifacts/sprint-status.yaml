@@ -64,7 +64,7 @@ development_status:
   epic-4: backlog
   4-1-tools-与-legacy-functions-入参兼容: done
   4-2-tool-calls-输出与-tool-call-id-一致性: done
-  4-3-tool-结果回填与继续生成闭环: review
+  4-3-tool-结果回填与继续生成闭环: done
   4-4-mcp-safe-透传与服务端执行隔离: backlog
   epic-4-retrospective: optional
 
