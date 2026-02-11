@@ -1,6 +1,6 @@
 # Story 4.1: tools 与 legacy functions 入参兼容
 
-Status: review
+Status: done
 
 ## Story
 
@@ -90,3 +90,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 4.1（tools 与 legacy functions 入参兼容）：新增入参归一化兼容层并补齐回归测试。
+- 2026-02-11: 完成 Story 4.1 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 建议后续在入参校验层增加 `functions/tool_choice` 枚举与 schema 约束，尽量把异常输入拦在更早阶段。
+
+### Verification
+
+- `npm test` 通过（33 passed, 2 skipped）
