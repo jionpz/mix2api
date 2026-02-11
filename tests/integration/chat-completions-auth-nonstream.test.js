@@ -663,3 +663,103 @@ test('POST /v1/chat/completions with malformed JSON returns 400 OpenAI error env
   assert.equal(json?.error?.param, null);
   assert.equal(requests.length, 0);
 });
+
+test('POST /v1/chat/completions reuses explicitly provided session_id across turns', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const explicitSessionId = 'sess-explicit-123';
+  const headers = {
+    'content-type': 'application/json',
+    authorization: 'Bearer inbound-test-token',
+    'user-agent': 'OpenCode/1.0'
+  };
+
+  const requestBody = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    session_id: explicitSessionId,
+    messages: [{ role: 'user', content: 'keep this explicit session' }]
+  };
+
+  const first = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(requestBody)
+  });
+  const second = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(requestBody)
+  });
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].body?.session_id, explicitSessionId);
+  assert.equal(requests[1].body?.session_id, explicitSessionId);
+});
+
+test('POST /v1/chat/completions isolates auto-session by auth+model+client key', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const baseBody = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    messages: [{ role: 'user', content: 'session isolation test' }]
+  };
+
+  const openCodeHeaders = {
+    'content-type': 'application/json',
+    authorization: 'Bearer inbound-test-token',
+    'user-agent': 'OpenCode/1.0'
+  };
+  const claudeHeaders = {
+    'content-type': 'application/json',
+    authorization: 'Bearer inbound-test-token',
+    'user-agent': 'Claude Code/1.0'
+  };
+
+  const first = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: openCodeHeaders,
+    body: JSON.stringify(baseBody)
+  });
+  const second = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: claudeHeaders,
+    body: JSON.stringify(baseBody)
+  });
+  const third = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: openCodeHeaders,
+    body: JSON.stringify(baseBody)
+  });
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(third.status, 200);
+  assert.equal(requests.length, 3);
+
+  // 第 1 次请求（OpenCode）无历史 session，应不携带 session_id
+  assert.equal(requests[0].body?.session_id, undefined);
+  // 第 2 次请求（Claude Code）应按 client 隔离，不复用 OpenCode 的 session
+  assert.equal(requests[1].body?.session_id, undefined);
+  // 第 3 次请求（OpenCode）应复用第 1 次写入的 session（mock upstream 返回 sess-json）
+  assert.equal(requests[2].body?.session_id, 'sess-json');
+});

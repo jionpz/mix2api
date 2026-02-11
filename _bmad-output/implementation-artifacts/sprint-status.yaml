@@ -48,7 +48,7 @@ development_status:
   epic-1-retrospective: optional
 
   epic-2: backlog
-  2-1-会话隔离键与显式会话输入支持: backlog
+  2-1-会话隔离键与显式会话输入支持: review
   2-2-上游-token-生命周期管理: backlog
   2-3-自动会话创建与上游会话复用: backlog
   2-4-redis-共享状态与-schemaversion-降级机制: backlog
