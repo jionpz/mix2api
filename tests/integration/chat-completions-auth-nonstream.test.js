@@ -143,9 +143,11 @@ async function startMockUpstream(port, {
   streamDelayAfterFirstDeltaMs = 0,
   delayBeforeAnyResponseMs = 0,
   forceStreamDropAfterFirstDelta = false,
-  nonStreamContent = 'mocked upstream answer'
+  nonStreamContent = 'mocked upstream answer',
+  nonStreamContents = null
 } = {}) {
   const requests = [];
+  let nonStreamIndex = 0;
   const server = http.createServer(async (req, res) => {
     let bodyText = '';
     req.on('data', (chunk) => {
@@ -212,8 +214,12 @@ async function startMockUpstream(port, {
           }
 
           res.writeHead(200, { 'content-type': 'application/json' });
+          const resolvedNonStreamContent = Array.isArray(nonStreamContents) && nonStreamContents.length > 0
+            ? nonStreamContents[Math.min(nonStreamIndex, nonStreamContents.length - 1)]
+            : nonStreamContent;
+          nonStreamIndex += 1;
           res.end(JSON.stringify({
-            content: nonStreamContent,
+            content: resolvedNonStreamContent,
             messageMetadata: {
               sessionId: 'sess-json',
               exchangeId: 'ex-json'
@@ -1630,6 +1636,141 @@ test('POST /v1/chat/completions stream tool_calls keep unique ids when upstream 
   assert.notEqual(toolCalls[0].id, toolCalls[1].id);
   assert.match(body, /"finish_reason":"tool_calls"/);
   assert.match(body, /data: \[DONE\]/);
+});
+
+test('POST /v1/chat/completions continues after tool result backfill (tool loop)', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort, {
+    nonStreamContents: [
+      JSON.stringify({
+        tool_calls: [
+          { name: 'read_file', arguments: { path: 'README.md' } },
+          { name: 'grep_code', arguments: { pattern: 'TODO' } }
+        ]
+      }),
+      'final answer after tool results'
+    ]
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'grep_code',
+        parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] }
+      }
+    }
+  ];
+
+  const firstRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools,
+      messages: [{ role: 'user', content: 'read and grep code' }]
+    })
+  });
+
+  assert.equal(firstRes.status, 200);
+  const firstJson = await firstRes.json();
+  assert.equal(firstJson.choices[0].finish_reason, 'tool_calls');
+  assert.equal(firstJson.choices[0].message.content, null);
+  assert.equal(Array.isArray(firstJson.choices[0].message.tool_calls), true);
+  assert.equal(firstJson.choices[0].message.tool_calls.length, 2);
+
+  const tc1 = firstJson.choices[0].message.tool_calls[0];
+  const tc2 = firstJson.choices[0].message.tool_calls[1];
+  assert.ok(/^call_/.test(tc1.id));
+  assert.ok(/^call_/.test(tc2.id));
+
+  const secondRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools,
+      messages: [
+        { role: 'user', content: 'read and grep code' },
+        { role: 'assistant', content: null, tool_calls: firstJson.choices[0].message.tool_calls },
+        { role: 'tool', tool_call_id: tc1.id, content: 'README content here' },
+        { role: 'tool', tool_call_id: tc2.id, content: 'TODO matches here' }
+      ]
+    })
+  });
+
+  assert.equal(secondRes.status, 200);
+  const secondJson = await secondRes.json();
+  assert.equal(secondJson.choices[0].finish_reason, 'stop');
+  assert.equal(typeof secondJson.choices[0].message.content, 'string');
+  assert.match(secondJson.choices[0].message.content, /final answer after tool results/);
+  assert.equal(requests.length, 2);
+});
+
+test('POST /v1/chat/completions rejects mismatched tool_call_id in tool backfill', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'tool backfill mismatch' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_expected',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' }
+          }]
+        },
+        { role: 'tool', tool_call_id: 'call_wrong', content: 'some result' }
+      ]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.type, 'invalid_request_error');
+  assert.equal(json?.error?.code, 'tool_call_id_mismatch');
+  assert.equal(json?.error?.param, 'messages');
+  assert.equal(requests.length, 0);
 });
 
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {

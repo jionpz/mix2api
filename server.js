@@ -954,6 +954,77 @@ function collectTrailingToolMessages(messages) {
   return out.reverse();
 }
 
+function validateTrailingToolBackfill(messages) {
+  const toolMessages = collectTrailingToolMessages(messages);
+  if (toolMessages.length === 0) return null;
+
+  const firstToolIndex = messages.length - toolMessages.length;
+  const prev = messages[firstToolIndex - 1];
+  if (!prev || prev.role !== 'assistant' || !Array.isArray(prev.tool_calls) || prev.tool_calls.length === 0) {
+    return {
+      code: 'missing_assistant_tool_calls',
+      message: 'Invalid tool backfill: trailing tool messages must follow an assistant message with tool_calls',
+      param: 'messages'
+    };
+  }
+
+  const idToName = new Map();
+  for (const call of prev.tool_calls) {
+    if (!call || typeof call !== 'object') continue;
+    const id = typeof call.id === 'string' ? call.id.trim() : '';
+    if (!id) continue;
+    const name = call.function && typeof call.function.name === 'string' ? call.function.name : '';
+    idToName.set(id, name);
+  }
+
+  if (idToName.size === 0) {
+    return {
+      code: 'missing_tool_call_id',
+      message: 'Invalid tool backfill: assistant.tool_calls[] must include id fields',
+      param: 'messages'
+    };
+  }
+
+  const seen = new Set();
+  for (const m of toolMessages) {
+    const toolCallId = typeof m.tool_call_id === 'string' ? m.tool_call_id.trim() : '';
+    if (!toolCallId) {
+      return {
+        code: 'missing_tool_call_id',
+        message: 'Invalid tool backfill: tool messages must include tool_call_id',
+        param: 'messages'
+      };
+    }
+    if (!idToName.has(toolCallId)) {
+      return {
+        code: 'tool_call_id_mismatch',
+        message: `Invalid tool backfill: tool_call_id not found in previous assistant.tool_calls: ${toolCallId}`,
+        param: 'messages'
+      };
+    }
+    if (seen.has(toolCallId)) {
+      return {
+        code: 'duplicate_tool_call_id',
+        message: `Invalid tool backfill: duplicate tool_call_id in tool messages: ${toolCallId}`,
+        param: 'messages'
+      };
+    }
+    seen.add(toolCallId);
+
+    const expectedName = idToName.get(toolCallId) || '';
+    const providedName = typeof m.name === 'string' ? m.name.trim() : '';
+    if (providedName && expectedName && providedName !== expectedName) {
+      return {
+        code: 'tool_name_mismatch',
+        message: `Invalid tool backfill: tool name does not match tool_call_id ${toolCallId} (expected ${expectedName}, got ${providedName})`,
+        param: 'messages'
+      };
+    }
+  }
+
+  return null;
+}
+
 function formatToolResultsForPrompt(toolMessages) {
   if (!Array.isArray(toolMessages) || toolMessages.length === 0) return '';
   const maxChars = envInt('TOOL_RESULT_MAX_CHARS', 20_000);
@@ -1915,6 +1986,16 @@ async function handleChatCompletion(req, res) {
     }
 
     const openaiRequest = normalizeOpenAIRequestTooling(requestBody);
+    const toolingBackfillError = validateTrailingToolBackfill(openaiRequest.messages);
+    if (toolingBackfillError) {
+      setRequestEndReason(res, 'invalid_request');
+      return sendOpenAIError(res, 400, {
+        message: toolingBackfillError.message,
+        type: 'invalid_request_error',
+        code: toolingBackfillError.code,
+        param: toolingBackfillError.param
+      });
+    }
 
     const requestClient = inferClientId(req);
     const clientWantsStream = openaiRequest.stream !== false;
