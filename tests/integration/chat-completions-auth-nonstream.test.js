@@ -1434,6 +1434,78 @@ test('POST /v1/chat/completions redacts sensitive headers in logs when LOG_HEADE
   assert.match(logs, /"x-session-id"\s*:\s*"\*\*\*"/);
 });
 
+test('POST /v1/chat/completions sample trace is disabled by default', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'sampling should stay disabled' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(120);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.doesNotMatch(logs, /trace\.sampled/);
+});
+
+test('POST /v1/chat/completions sampled traces are retained then auto-purged by TTL', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      TRACE_SAMPLING_ENABLED: 'true',
+      TRACE_SAMPLING_RATE: '1',
+      TRACE_RETENTION_MS: '120',
+      TRACE_CLEANUP_INTERVAL_MS: '40',
+      TRACE_MAX_ENTRIES: '50'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'sampling should be retained then purged' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(360);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /trace\.sampled/);
+  assert.match(logs, /trace\.purged count=[1-9]\d*/);
+});
+
 test('POST /v1/chat/completions forwards tools schema fields without losing key parameters', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();

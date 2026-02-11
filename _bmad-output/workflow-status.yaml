@@ -43,6 +43,7 @@ outputs:
   story_4_3: '_bmad-output/implementation-artifacts/4-3-tool-结果回填与继续生成闭环.md'
   story_4_4: '_bmad-output/implementation-artifacts/4-4-mcp-safe-透传与服务端执行隔离.md'
   story_5_1: '_bmad-output/implementation-artifacts/5-1-最小日志策略与字段级脱敏.md'
+  story_5_2: '_bmad-output/implementation-artifacts/5-2-可选采样留痕与-1-天保留策略.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -103,3 +104,5 @@ notes:
   - 'Created Story 5.1 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 5.1 and moved it to review on 2026-02-11.'
   - 'Story 5.1 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 5.2 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 5.2 and moved it to review on 2026-02-11.'

@@ -70,7 +70,7 @@ development_status:
 
   epic-5: backlog
   5-1-最小日志策略与字段级脱敏: done
-  5-2-可选采样留痕与-1-天保留策略: backlog
+  5-2-可选采样留痕与-1-天保留策略: review
   5-3-接入文档与-openapi-契约文档交付: backlog
   5-4-回归包-a-b-c-与发布门禁流程: backlog
   epic-5-retrospective: optional

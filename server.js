@@ -177,6 +177,7 @@ app.use((req, res, next) => {
     const stream = res.locals && res.locals.stream != null ? res.locals.stream : 'unknown';
     const toolsPresent = res.locals && res.locals.toolsPresent != null ? res.locals.toolsPresent : 'unknown';
     console.log(`[${new Date().toISOString()}] [${requestId}] request.completed http_status=${res.statusCode} duration_ms=${durationMs} client=${client} stream=${stream} tools_present=${toolsPresent} end_reason=${endReason} upstream_status=${upstreamStatus}`);
+    maybeRecordSampleTrace(req, res, { durationMs, startedAt });
   });
   next();
 });
@@ -203,6 +204,11 @@ const SESSION_STORE_MODE = String(process.env.SESSION_STORE_MODE || 'redis').tri
 const REDIS_URL = String(process.env.REDIS_URL || '').trim();
 const REDIS_CONNECT_TIMEOUT_MS = envInt('REDIS_CONNECT_TIMEOUT_MS', 2000);
 const REDIS_SESSION_PREFIX = String(process.env.REDIS_SESSION_PREFIX || 'mix2api:session').trim();
+const TRACE_SAMPLING_ENABLED = envBool('TRACE_SAMPLING_ENABLED', false);
+const TRACE_SAMPLING_RATE = Math.max(0, Math.min(1, Number(process.env.TRACE_SAMPLING_RATE || 0)));
+const TRACE_RETENTION_MS = Math.max(1, envInt('TRACE_RETENTION_MS', 24 * 60 * 60 * 1000));
+const TRACE_MAX_ENTRIES = Math.max(1, envInt('TRACE_MAX_ENTRIES', 1000));
+const TRACE_CLEANUP_INTERVAL_MS = Math.max(10, envInt('TRACE_CLEANUP_INTERVAL_MS', 60 * 1000));
 
 // ===== Session Store =====
 // 上游会话管理：
@@ -215,6 +221,8 @@ let redisSessionClient = null;
 let redisSessionInitPromise = null;
 let redisSessionDisabledReason = null;
 let redisSessionNextRetryAt = 0;
+const sampleTraceStore = new Map(); // traceId -> sampled trace meta
+let sampleTraceCleanupTimer = null;
 
 function shouldUseRedisSessionStore() {
   return SESSION_STORE_MODE === 'redis' || SESSION_STORE_MODE === 'auto';
@@ -442,6 +450,98 @@ function fingerprint(input) {
   if (input === undefined || input === null) return 'none';
   const s = String(input);
   return crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
+}
+
+function purgeExpiredSampleTraces(nowMs, reason) {
+  if (sampleTraceStore.size === 0) return 0;
+  const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  let removed = 0;
+  for (const [traceId, trace] of sampleTraceStore.entries()) {
+    const expiresAt = trace && Number.isFinite(Number(trace.expiresAt)) ? Number(trace.expiresAt) : 0;
+    if (expiresAt > 0 && expiresAt <= now) {
+      sampleTraceStore.delete(traceId);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    const why = reason ? ` reason=${reason}` : '';
+    console.log(`[${new Date().toISOString()}] trace.purged count=${removed} remaining=${sampleTraceStore.size}${why}`);
+  }
+  return removed;
+}
+
+function evictOldestSampleTraceIfNeeded() {
+  while (sampleTraceStore.size >= TRACE_MAX_ENTRIES) {
+    const oldestKey = sampleTraceStore.keys().next();
+    if (!oldestKey || oldestKey.done) break;
+    sampleTraceStore.delete(oldestKey.value);
+  }
+}
+
+function shouldSampleCurrentRequest() {
+  if (!TRACE_SAMPLING_ENABLED) return false;
+  if (!Number.isFinite(TRACE_SAMPLING_RATE) || TRACE_SAMPLING_RATE <= 0) return false;
+  if (TRACE_SAMPLING_RATE >= 1) return true;
+  return Math.random() < TRACE_SAMPLING_RATE;
+}
+
+function buildSampleTrace(req, res, meta) {
+  const now = Date.now();
+  const requestId = req && req.requestId ? String(req.requestId) : uuidv4();
+  const body = (req && req.body && typeof req.body === 'object') ? req.body : {};
+  const headers = req && req.headers ? req.headers : {};
+  const messageCount = Array.isArray(body.messages) ? body.messages.length : 0;
+  const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+  const hasFunctions = Array.isArray(body.functions) && body.functions.length > 0;
+  const authHeader = Array.isArray(headers.authorization) ? headers.authorization[0] : headers.authorization;
+
+  return {
+    traceId: `trace_${uuidv4()}`,
+    requestId,
+    createdAt: now,
+    expiresAt: now + TRACE_RETENTION_MS,
+    method: req && req.method ? String(req.method) : 'UNKNOWN',
+    path: req && req.url ? String(req.url) : '/',
+    client: res && res.locals && res.locals.client != null ? String(res.locals.client) : 'unknown',
+    stream: res && res.locals && res.locals.stream != null ? String(res.locals.stream) : 'unknown',
+    toolsPresent: res && res.locals && res.locals.toolsPresent != null ? String(res.locals.toolsPresent) : 'unknown',
+    endReason: res && res.locals && res.locals.endReason ? String(res.locals.endReason) : 'unknown',
+    httpStatus: res && Number.isFinite(Number(res.statusCode)) ? Number(res.statusCode) : 0,
+    upstreamStatus: res && res.locals && res.locals.upstreamStatus != null ? String(res.locals.upstreamStatus) : 'none',
+    durationMs: meta && Number.isFinite(Number(meta.durationMs)) ? Number(meta.durationMs) : 0,
+    requestSummary: {
+      model: typeof body.model === 'string' ? body.model : null,
+      messageCount,
+      toolCount,
+      hasLegacyFunctions: hasFunctions,
+      authFingerprint: authHeader ? fingerprint(authHeader) : 'none'
+    }
+  };
+}
+
+function maybeRecordSampleTrace(req, res, meta) {
+  if (!shouldSampleCurrentRequest()) return;
+  const now = Date.now();
+  purgeExpiredSampleTraces(now, 'before_store');
+  evictOldestSampleTraceIfNeeded();
+  const trace = buildSampleTrace(req, res, meta);
+  sampleTraceStore.set(trace.traceId, trace);
+  console.log(
+    `[${new Date().toISOString()}] [${trace.requestId}] trace.sampled trace_id=${trace.traceId} ` +
+    `expires_at=${new Date(trace.expiresAt).toISOString()} status=${trace.httpStatus} ` +
+    `end_reason=${trace.endReason} client=${trace.client} stream=${trace.stream} tools_present=${trace.toolsPresent}`
+  );
+}
+
+function startSampleTraceCleanupTask() {
+  if (!TRACE_SAMPLING_ENABLED) return;
+  if (sampleTraceCleanupTimer) return;
+  sampleTraceCleanupTimer = setInterval(() => {
+    purgeExpiredSampleTraces(Date.now(), 'timer');
+  }, TRACE_CLEANUP_INTERVAL_MS);
+  if (typeof sampleTraceCleanupTimer.unref === 'function') {
+    sampleTraceCleanupTimer.unref();
+  }
 }
 
 const managedUpstreamTokenState = {
@@ -2692,5 +2792,6 @@ app.listen(PORT, () => {
   console.log(`mix2api adapter running on port ${PORT}`);
   console.log(`Access at: http://localhost:${PORT}`);
   console.log(`OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
+  startSampleTraceCleanupTask();
   void initRedisSessionClient();
 });
