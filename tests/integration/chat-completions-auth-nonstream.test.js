@@ -850,6 +850,8 @@ test('POST /v1/chat/completions isolates auto-session by auth+model+client key',
   assert.equal(requests[1].body?.session_id, undefined);
   // 第 3 次请求（OpenCode）应复用第 1 次写入的 session（mock upstream 返回 sess-json）
   assert.equal(requests[2].body?.session_id, 'sess-json');
+  // 第 3 次请求（OpenCode）应复用第 1 次写入的 exchange_id（mock upstream 返回 ex-json）
+  assert.equal(requests[2].body?.exchange_id, 'ex-json');
 });
 
 test('POST /v1/chat/completions with managed auth fetches upstream token when cache is empty', async (t) => {

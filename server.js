@@ -163,13 +163,14 @@ function updateStoredSession(key, sessionId, exchangeId) {
   if (!key) return;
   const existing = sessionStore.get(key);
   const turnCount = existing && existing.sessionId === sessionId ? (existing.turnCount || 0) + 1 : 1;
+  const nextExchangeId = exchangeId || ((existing && existing.sessionId === sessionId) ? existing.exchangeId : null);
   sessionStore.set(key, {
     sessionId: sessionId || null,
-    exchangeId: exchangeId || null,
+    exchangeId: nextExchangeId || null,
     timestamp: Date.now(),
     turnCount
   });
-  console.log(`📌 Session stored: key=${key}, sessionId=${sessionId}, turnCount=${turnCount}`);
+  console.log(`📌 Session stored: key=${key}, sessionId=${sessionId}, exchangeId=${nextExchangeId || 'null'}, turnCount=${turnCount}`);
 }
 
 function clearStoredSession(key) {
@@ -860,7 +861,7 @@ function formatConversationForQuery(messages) {
 }
 
 // OpenAI 格式转上游格式 (完整传递，支持工具调用)
-function convertToUpstreamFormat(openaiRequest, sessionId, personaId, storedSession) {
+function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession) {
   const lastMessage = openaiRequest.messages[openaiRequest.messages.length - 1];
   const rawTools = Array.isArray(openaiRequest.tools) ? openaiRequest.tools : [];
   
@@ -1010,6 +1011,9 @@ function convertToUpstreamFormat(openaiRequest, sessionId, personaId, storedSess
   // 注意：上游请求用 session_id（下划线），响应用 sessionId（驼峰）
   if (sessionId && sessionId !== 'new') {
     upstreamRequest.session_id = sessionId;
+  }
+  if (exchangeId && exchangeId !== 'new') {
+    upstreamRequest.exchange_id = exchangeId;
   }
   
   return { upstreamRequest, toolMode, hasToolResults };
@@ -1628,13 +1632,21 @@ async function handleChatCompletion(req, res) {
       || openaiRequest.sessionId
       || (openaiRequest.metadata && (openaiRequest.metadata.session_id || openaiRequest.metadata.sessionId))
     ) || null;
+    const exchangeIdFromHeader = req.headers['x-exchange-id'] || req.headers['x-exchange_id'] || null;
+    const exchangeIdFromBody = openaiRequest && (
+      openaiRequest.exchange_id
+      || openaiRequest.exchangeId
+      || (openaiRequest.metadata && (openaiRequest.metadata.exchange_id || openaiRequest.metadata.exchangeId))
+    ) || null;
     let sessionId = sessionIdFromHeader || sessionIdFromBody || null;
+    let exchangeId = exchangeIdFromHeader || exchangeIdFromBody || null;
     const storeKey = getSessionStoreKey(req, openaiRequest.model, inboundToken || '');
 
     // "new" 表示显式开始新会话
     if (sessionId === 'new') {
       clearStoredSession(storeKey);
       sessionId = null;
+      exchangeId = null;
       console.log(`ℹ Client requested new session (key=${storeKey})`);
     }
 
@@ -1643,6 +1655,9 @@ async function handleChatCompletion(req, res) {
       const stored = getStoredSession(storeKey);
       if (stored && stored.sessionId) {
         sessionId = stored.sessionId;
+        if (!exchangeId && stored.exchangeId) {
+          exchangeId = stored.exchangeId;
+        }
         console.log(`ℹ Auto-session from store: sessionId=${sessionId} (key=${storeKey})`);
       }
     }
@@ -1661,9 +1676,12 @@ async function handleChatCompletion(req, res) {
     if (storedSession && sessionId && storedSession.sessionId && storedSession.sessionId !== sessionId) {
       storedSession = null;
     }
+    if (storedSession && !exchangeId && storedSession.exchangeId) {
+      exchangeId = storedSession.exchangeId;
+    }
     
     // 转换请求格式（完整传递，支持工具调用）
-    const { upstreamRequest, toolMode, hasToolResults } = convertToUpstreamFormat(openaiRequest, sessionId, personaId, storedSession);
+    const { upstreamRequest, toolMode, hasToolResults } = convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession);
     
     console.log(`[${requestId}] 🔧 toolMode=${toolMode}, hasToolResults=${hasToolResults}, stream=${upstreamRequest.stream}, turnCount=${storedSession ? storedSession.turnCount : 0}`);
     
