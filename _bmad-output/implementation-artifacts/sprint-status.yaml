@@ -44,7 +44,7 @@ development_status:
   1-1-从-starter-template-初始化项目基线: done
   1-2-入站鉴权与非流式-chat-completions-入口: done
   1-3-流式开关路由与根路径兼容入口: done
-  1-4-模型探测与健康检查端点: backlog
+  1-4-模型探测与健康检查端点: review
   epic-1-retrospective: optional
 
   epic-2: backlog

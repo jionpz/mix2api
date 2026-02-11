@@ -108,6 +108,7 @@ const UPSTREAM_CHAT_PATH = String(process.env.UPSTREAM_CHAT_PATH || '/v2/chats')
 const UPSTREAM_REFERER = String(process.env.UPSTREAM_REFERER || '').trim();
 const UPSTREAM_ACCEPT_LANGUAGE = String(process.env.UPSTREAM_ACCEPT_LANGUAGE || 'zh-CN,zh;q=0.9,en;q=0.8').trim();
 const PORT = process.env.PORT || 3001;
+const DEFAULT_MODEL_IDS = ['mix/qwen-3-235b-instruct', 'mix/claude-sonnet-4-5'];
 
 // ===== Session Store =====
 // 上游会话管理：
@@ -162,6 +163,43 @@ function getSessionStoreKey(req, model, token) {
   const mode = String(process.env.SESSION_KEY_MODE || 'model').toLowerCase();
   if (mode === 'auth') return `${fingerprint(token)}::${modelPart}`;
   return modelPart;
+}
+
+function parseModelList(rawValue) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return [];
+
+  let modelCandidates = [];
+  if (raw.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        modelCandidates = parsed;
+      }
+    } catch {
+      modelCandidates = [];
+    }
+  }
+
+  if (modelCandidates.length === 0) {
+    modelCandidates = raw.split(/[\n,]/);
+  }
+
+  const result = [];
+  const seen = new Set();
+  for (const value of modelCandidates) {
+    const id = String(value || '').trim();
+    if (!id) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+function resolveModelIds() {
+  const models = parseModelList(process.env.MODEL_LIST);
+  return models.length > 0 ? models : DEFAULT_MODEL_IDS;
 }
 
 // 从上游 SSE START 帧中提取 exchangeId 和 sessionId
@@ -1790,12 +1828,7 @@ app.get('/health', (req, res) => {
 
 // 模型列表（兼容 OpenAI）
 app.get('/v1/models', (req, res) => {
-  const defaultModels = ['mix/qwen-3-235b-instruct', 'mix/claude-sonnet-4-5'];
-  const models = (process.env.MODEL_LIST || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const modelIds = models.length ? models : defaultModels;
+  const modelIds = resolveModelIds();
   res.json({
     object: 'list',
     data: modelIds.map((id) => ({

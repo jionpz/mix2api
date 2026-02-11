@@ -114,3 +114,87 @@ test('GET /health returns ok JSON and does not leak x-powered-by', async (t) => 
   const criticalStderr = getCriticalStderrLines(stderr);
   assert.deepEqual(criticalStderr, [], `unexpected critical server stderr output:\n${stderr}`);
 });
+
+test('GET /v1/models returns OpenAI-compatible default model list', async (t) => {
+  const port = await getFreePort();
+  const entry = path.resolve('server.js');
+
+  const proc = spawn(process.execPath, [entry], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      MODEL_LIST: '',
+      LOG_HEADERS: 'false',
+      LOG_BODIES: 'false'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let stderr = '';
+  proc.stderr.on('data', (buf) => {
+    stderr += buf.toString('utf8');
+  });
+
+  t.after(async () => {
+    await stopProc(proc);
+  });
+
+  await waitForHealthy({ port, timeoutMs: 5000 });
+
+  const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('x-request-id'));
+  assert.match(String(res.headers.get('content-type') || ''), /application\/json/i);
+
+  const body = await res.json();
+  assert.equal(body?.object, 'list');
+  assert.equal(Array.isArray(body?.data), true);
+
+  const ids = body.data.map((m) => m?.id);
+  assert.deepEqual(ids, ['mix/qwen-3-235b-instruct', 'mix/claude-sonnet-4-5']);
+  assert.ok(body.data.every((m) => m?.object === 'model'));
+  assert.ok(body.data.every((m) => m?.owned_by === 'mix2api'));
+  assert.ok(body.data.every((m) => Number.isInteger(m?.created)));
+
+  const criticalStderr = getCriticalStderrLines(stderr);
+  assert.deepEqual(criticalStderr, [], `unexpected critical server stderr output:\n${stderr}`);
+});
+
+test('GET /v1/models reflects configured MODEL_LIST values', async (t) => {
+  const port = await getFreePort();
+  const entry = path.resolve('server.js');
+
+  const proc = spawn(process.execPath, [entry], {
+    env: {
+      ...process.env,
+      PORT: String(port),
+      MODEL_LIST: 'mix/model-a,mix/model-b,\nmix/model-a,mix/model-c',
+      LOG_HEADERS: 'false',
+      LOG_BODIES: 'false'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let stderr = '';
+  proc.stderr.on('data', (buf) => {
+    stderr += buf.toString('utf8');
+  });
+
+  t.after(async () => {
+    await stopProc(proc);
+  });
+
+  await waitForHealthy({ port, timeoutMs: 5000 });
+
+  const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  assert.equal(res.status, 200);
+  assert.ok(res.headers.get('x-request-id'));
+
+  const body = await res.json();
+  assert.equal(body?.object, 'list');
+  const ids = body.data.map((m) => m?.id);
+  assert.deepEqual(ids, ['mix/model-a', 'mix/model-b', 'mix/model-c']);
+
+  const criticalStderr = getCriticalStderrLines(stderr);
+  assert.deepEqual(criticalStderr, [], `unexpected critical server stderr output:\n${stderr}`);
+});
