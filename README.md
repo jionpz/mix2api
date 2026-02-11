@@ -1,67 +1,134 @@
 # mix2api
 
-`mix2api` 是一个 **OpenAI Chat Completions 兼容**的上游适配层，推荐作为 `new-api` 的内部上游（channel）使用：
+`mix2api` 是一个 OpenAI Chat Completions 兼容适配层，推荐作为 `new-api` 的内部上游通道：
 
 ```
-Claude Code / OpenCode → new-api → mix2api → 你的上游模型网站
+Claude Code / OpenCode -> new-api -> mix2api -> upstream model site
 ```
 
-## 支持的接口
+## 1. API 范围
 
-- `POST /v1/chat/completions`（以及兼容 `POST /`）
+- `POST /v1/chat/completions`（兼容 `POST /`）
 - `GET /v1/models`
 - `GET /health`
 
-## 关键能力
+## 2. 快速接入
 
-- **流式 SSE** 与非流式返回
-- **工具调用 tool_calls**：返回 OpenAI 规范的 `tool_calls`，支持客户端工具循环
-- **session_id 自动管理**：从上游响应提取 `sessionId` 并自动复用（OpenCode 等客户端不透传时也能保持上下文）
-- **Redis 共享会话状态**：支持 stable/canary 共享 session，并在 `schemaVersion` 异常时自动降级为新会话
-- **上下文控制**：按需拼接对话历史、裁剪 messages、保留工具调用链
-- **去敏**：上游域名等敏感信息只放在 `.env`（仓库提供 `.env.example`）
-
-## 快速开始（本地）
-
-1) 复制配置：
+1. 初始化配置：
 
 ```bash
 cp .env.example .env
 ```
 
-2) 编辑 `.env`，至少设置：
+2. 最少配置：
 
 - `UPSTREAM_API_BASE`
-- （如需要）`UPSTREAM_CHAT_PATH` / `UPSTREAM_REFERER`
+- `UPSTREAM_CHAT_PATH`（默认 `/v2/chats`）
+- 依据部署策略选择鉴权模式（见下文）
 
-3) 运行：
+3. 启动：
 
 ```bash
-node server.js
+npm start
 ```
 
-默认监听 `http://localhost:3001`。
+默认监听：`http://localhost:3001`
 
-## 与 new-api 配合
+4. 烟测：
 
-在 new-api 控制台新增一个 **OpenAI Compatible** 的 channel，上游 base_url 指向 `mix2api`（容器内建议用服务名，例如 `http://mix2api:3001`）。
+```bash
+curl -sS http://127.0.0.1:3001/health
+curl -sS http://127.0.0.1:3001/v1/models
+```
 
-鉴权建议：
+## 3. 与 new-api 集成
 
-- 默认 `UPSTREAM_AUTH_MODE=pass_through`：入站 `Authorization: Bearer <token>` 会被当作上游 token（兼容旧用法）。
-- 与 `new-api` 集成时建议：
-  - `INBOUND_AUTH_MODE=bearer` + `INBOUND_BEARER_TOKEN=<channel key>`（只允许 new-api 调用）
-  - `UPSTREAM_AUTH_MODE=static` + `UPSTREAM_BEARER_TOKEN=<上游 token>`（上游鉴权与入站解耦）
-- 如需由适配器托管上游登录态：
-  - `UPSTREAM_AUTH_MODE=managed`
-  - 配置 `UPSTREAM_TOKEN_URL`（或 `UPSTREAM_TOKEN_PATH`）及可选 `UPSTREAM_TOKEN_BODY_JSON`
-  - 当上游返回鉴权失效（如 401/403 或 token expired 错误）时，适配器会自动刷新 token 并重试一次
-- 如需在 stable/canary 间共享会话状态：
-  - `SESSION_STORE_MODE=redis`
-  - `REDIS_URL=redis://<host>:6379`
-  - 可选 `REDIS_SESSION_PREFIX` 定义 key 前缀
+在 new-api 控制台新增 OpenAI Compatible channel，`base_url` 指向 `mix2api`（容器内建议 `http://mix2api:3001`）。
 
-更多设计细节见：
+推荐配置（生产）：
+
+- `INBOUND_AUTH_MODE=bearer`
+- `INBOUND_BEARER_TOKEN=<new-api channel key>`
+- `UPSTREAM_AUTH_MODE=static`
+- `UPSTREAM_BEARER_TOKEN=<upstream token>`
+
+常见鉴权模式：
+
+- `UPSTREAM_AUTH_MODE=pass_through`：
+  入站 Bearer 直接透传为上游 token（兼容旧链路）
+- `UPSTREAM_AUTH_MODE=static`：
+  入站鉴权与上游鉴权分离（推荐）
+- `UPSTREAM_AUTH_MODE=managed`：
+  由适配器管理上游 token 生命周期（支持自动刷新+重试）
+
+会话共享（stable/canary 必开）：
+
+- `SESSION_STORE_MODE=redis`
+- `REDIS_URL=redis://<host>:6379`
+- 可选 `REDIS_SESSION_PREFIX` 自定义前缀
+
+## 4. 灰度与回滚建议
+
+推荐放量：`0% -> 5% -> 20% -> 50% -> 100%`。每一档至少观察 10 分钟。
+
+建议观察指标（按 `client` 分组）：
+
+- `end_reason=timeout|upstream_error|adapter_error` 占比
+- `stream=true` 的 `[DONE]` 完成率
+- tool loop 成功率（`finish_reason=tool_calls` 后是否能继续生成）
+
+建议回滚触发：
+
+- 非 `client_abort` 的异常终止率超阈值
+- stream `[DONE]` 覆盖率异常下降
+- tools 闭环回归失败
+
+回滚动作：
+
+1. new-api 将 canary 权重降到 0%
+2. 保留 `x-request-id` 样本用于复盘
+3. 修复后从 5% 重新放量
+
+## 5. 最小回归包 A/B/C（发布门禁）
+
+包 A（stream 基线）：
+
+```bash
+node --test --test-name-pattern "stream=true|DONE|flushes first chunk" tests/integration/chat-completions-auth-nonstream.test.js
+```
+
+包 B（tools / legacy / loop）：
+
+```bash
+node --test --test-name-pattern "legacy functions|tool_calls|tool backfill|MCP-safe" tests/integration/chat-completions-auth-nonstream.test.js
+```
+
+包 C（取消 / 超时 / 上游错误）：
+
+```bash
+node --test --test-name-pattern "timeout|client abort|upstream HTTP error" tests/integration/chat-completions-auth-nonstream.test.js
+```
+
+全量回归：
+
+```bash
+npm test
+```
+
+## 6. OpenAPI 契约
+
+OpenAPI 3.0 文档位于：
+
+- `docs/openapi.yaml`
+
+覆盖内容：
+
+- `/v1/chat/completions`（流式与非流式）
+- `/v1/models`
+- `/health`
+- 兼容错误响应（`error.message/type/code/param`）
+
+## 7. 相关设计文档
 
 - `docs/architecture.md`
 - `docs/session.md`
