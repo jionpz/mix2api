@@ -1,6 +1,6 @@
 # Story 4.2: tool_calls 输出与 tool_call_id 一致性
 
-Status: review
+Status: done
 
 ## Story
 
@@ -90,3 +90,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 4.2（tool_calls 输出与 tool_call_id 一致性）：统一 id 归一化与多调用去重策略并补齐回归测试。
+- 2026-02-11: 完成 Story 4.2 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 当前 `tool_call_id` 生成策略在同一请求内稳定且可追踪；后续如要做到“跨重试/跨流段稳定”，建议把 id 绑定到规范化后的 `name+arguments` 哈希并加冲突盐。
+
+### Verification
+
+- `node --test` 通过（35 passed, 2 skipped）
