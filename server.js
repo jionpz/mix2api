@@ -30,6 +30,9 @@ app.use((req, res, next) => {
   res.locals.requestId = requestId;
   res.locals.endReason = 'unknown';
   res.locals.upstreamStatus = null;
+  res.locals.client = 'unknown';
+  res.locals.stream = 'unknown';
+  res.locals.toolsPresent = 'unknown';
   res.setHeader('x-request-id', requestId);
   next();
 });
@@ -152,7 +155,10 @@ app.use((req, res, next) => {
     const durationMs = Date.now() - startedAt;
     const endReason = res.locals && res.locals.endReason ? res.locals.endReason : 'unknown';
     const upstreamStatus = res.locals && res.locals.upstreamStatus != null ? res.locals.upstreamStatus : 'none';
-    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed status=${res.statusCode} duration_ms=${durationMs} end_reason=${endReason} upstream_status=${upstreamStatus}`);
+    const client = res.locals && res.locals.client != null ? res.locals.client : 'unknown';
+    const stream = res.locals && res.locals.stream != null ? res.locals.stream : 'unknown';
+    const toolsPresent = res.locals && res.locals.toolsPresent != null ? res.locals.toolsPresent : 'unknown';
+    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed http_status=${res.statusCode} duration_ms=${durationMs} client=${client} stream=${stream} tools_present=${toolsPresent} end_reason=${endReason} upstream_status=${upstreamStatus}`);
   });
   next();
 });
@@ -1794,6 +1800,16 @@ async function handleChatCompletion(req, res) {
       });
     }
 
+    const requestClient = inferClientId(req);
+    const clientWantsStream = openaiRequest.stream !== false;
+    const toolsPresent = (
+      (Array.isArray(openaiRequest.tools) && openaiRequest.tools.length > 0)
+      || (Array.isArray(openaiRequest.functions) && openaiRequest.functions.length > 0)
+    );
+    res.locals.client = requestClient;
+    res.locals.stream = String(clientWantsStream);
+    res.locals.toolsPresent = String(toolsPresent);
+
     let upstreamToken = null;
     if (upstreamAuthMode === 'pass_through') {
       if (!inboundToken) {
@@ -1915,7 +1931,6 @@ async function handleChatCompletion(req, res) {
       || (openaiRequest && (openaiRequest.persona_id || openaiRequest.personaId))
       || (openaiRequest && openaiRequest.request && (openaiRequest.request.persona_id || openaiRequest.request.personaId))
     ) || null;
-    const clientWantsStream = openaiRequest.stream !== false;
     
     // 获取存储的session信息（用于判断轮次）
     let storedSession = await getStoredSession(storeKey);

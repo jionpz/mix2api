@@ -1299,6 +1299,90 @@ test('POST /v1/chat/completions stream client abort is classified as end_reason=
   assert.equal(health.status, 200);
 });
 
+test('POST /v1/chat/completions request.completed logs fixed dimensions for success', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      'user-agent': 'OpenCode/1.0'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read file',
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path']
+          }
+        }
+      }],
+      messages: [{ role: 'user', content: 'check metrics dimensions' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /request\.completed[^\n]*client=opencode/);
+  assert.match(logs, /request\.completed[^\n]*stream=true/);
+  assert.match(logs, /request\.completed[^\n]*tools_present=true/);
+  assert.match(logs, /request\.completed[^\n]*end_reason=stop/);
+  assert.match(logs, /request\.completed[^\n]*http_status=200/);
+  assert.match(logs, /request\.completed[^\n]*upstream_status=200/);
+});
+
+test('POST /v1/chat/completions request.completed logs fixed dimensions for upstream errors', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, { forceStatus: 503 });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      'user-agent': 'Claude Code/1.0'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'trigger metrics error dimensions' }]
+    })
+  });
+
+  assert.equal(res.status, 503);
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /request\.completed[^\n]*client=claude-code/);
+  assert.match(logs, /request\.completed[^\n]*stream=false/);
+  assert.match(logs, /request\.completed[^\n]*tools_present=false/);
+  assert.match(logs, /request\.completed[^\n]*end_reason=upstream_error/);
+  assert.match(logs, /request\.completed[^\n]*http_status=503/);
+  assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
+});
+
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
   if (!HAS_REDIS_SERVER) {
     t.skip('redis-server not available in test environment');
