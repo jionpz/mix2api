@@ -10,6 +10,7 @@ new-api-data/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+_bmad-output/release-gates/
 
 # OS / editor
 .DS_Store
