@@ -17,13 +17,18 @@
 
 ## session store（自动复用）
 
-存储结构（内存 Map）：
+存储结构（Redis/内存）：
 
-- `key -> { sessionId, exchangeId, timestamp, turnCount }`
+- `key -> { schemaVersion, sessionId, exchangeId, timestamp, turnCount }`
+
+默认 `SESSION_STORE_MODE=redis`（配置了 `REDIS_URL` 时优先使用 Redis；不可用时自动降级到内存）。
+
+- Redis key 前缀：`REDIS_SESSION_PREFIX`（默认 `mix2api:session`）
+- schema 校验：`schemaVersion` 必须匹配当前版本；未知/损坏会按 miss 降级为新会话
 
 ### key 的隔离策略
 
-默认只按 `model` 维度隔离（`SESSION_KEY_MODE=model`）。
+默认按 `auth + model + client` 隔离（`SESSION_KEY_MODE=auth_model_client`）。
 
 如果你把 `mix2api` 放在 `new-api` 后面，为避免不同渠道/Key 互相串上下文，建议设置：
 
@@ -39,4 +44,3 @@
 
 - `SESSION_TTL_MS` 控制自动过期时间（默认 30 分钟）
 - 客户端也可以通过请求的 `x-session-id: new` 或 body 的 `session_id: "new"` 强制开启新会话（并清理当前 key 的缓存）
-

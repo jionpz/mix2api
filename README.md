@@ -17,6 +17,7 @@ Claude Code / OpenCode → new-api → mix2api → 你的上游模型网站
 - **流式 SSE** 与非流式返回
 - **工具调用 tool_calls**：返回 OpenAI 规范的 `tool_calls`，支持客户端工具循环
 - **session_id 自动管理**：从上游响应提取 `sessionId` 并自动复用（OpenCode 等客户端不透传时也能保持上下文）
+- **Redis 共享会话状态**：支持 stable/canary 共享 session，并在 `schemaVersion` 异常时自动降级为新会话
 - **上下文控制**：按需拼接对话历史、裁剪 messages、保留工具调用链
 - **去敏**：上游域名等敏感信息只放在 `.env`（仓库提供 `.env.example`）
 
@@ -55,6 +56,10 @@ node server.js
   - `UPSTREAM_AUTH_MODE=managed`
   - 配置 `UPSTREAM_TOKEN_URL`（或 `UPSTREAM_TOKEN_PATH`）及可选 `UPSTREAM_TOKEN_BODY_JSON`
   - 当上游返回鉴权失效（如 401/403 或 token expired 错误）时，适配器会自动刷新 token 并重试一次
+- 如需在 stable/canary 间共享会话状态：
+  - `SESSION_STORE_MODE=redis`
+  - `REDIS_URL=redis://<host>:6379`
+  - 可选 `REDIS_SESSION_PREFIX` 定义 key 前缀
 
 更多设计细节见：
 

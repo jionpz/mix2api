@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const { createClient } = require('redis');
 
 const app = express();
 app.disable('x-powered-by');
@@ -139,6 +140,11 @@ const UPSTREAM_TOKEN_EXPIRES_IN_FIELD = String(process.env.UPSTREAM_TOKEN_EXPIRE
 const UPSTREAM_TOKEN_TIMEOUT_MS = envInt('UPSTREAM_TOKEN_TIMEOUT_MS', 10000);
 const UPSTREAM_TOKEN_EXPIRY_SKEW_MS = envInt('UPSTREAM_TOKEN_EXPIRY_SKEW_MS', 60_000);
 const UPSTREAM_AUTH_RECOVERY_RETRY = envInt('UPSTREAM_AUTH_RECOVERY_RETRY', 1);
+const SESSION_SCHEMA_VERSION = 1;
+const SESSION_STORE_MODE = String(process.env.SESSION_STORE_MODE || 'redis').trim().toLowerCase(); // redis | auto | memory
+const REDIS_URL = String(process.env.REDIS_URL || '').trim();
+const REDIS_CONNECT_TIMEOUT_MS = envInt('REDIS_CONNECT_TIMEOUT_MS', 2000);
+const REDIS_SESSION_PREFIX = String(process.env.REDIS_SESSION_PREFIX || 'mix2api:session').trim();
 
 // ===== Session Store =====
 // 上游会话管理：
@@ -146,36 +152,231 @@ const UPSTREAM_AUTH_RECOVERY_RETRY = envInt('UPSTREAM_AUTH_RECOVERY_RETRY', 1);
 // - 后续请求在顶层带 sessionId = 上次响应的 sessionId
 // - OpenCode 不原生支持 session 透传，因此适配器自动管理
 const SESSION_TTL_MS = envInt('SESSION_TTL_MS', 30 * 60 * 1000); // 默认 30 分钟
-const sessionStore = new Map(); // key -> { sessionId, exchangeId, timestamp, turnCount }
+const sessionStore = new Map(); // key -> { schemaVersion, sessionId, exchangeId, timestamp, turnCount }
+let redisSessionClient = null;
+let redisSessionInitPromise = null;
+let redisSessionDisabledReason = null;
+let redisSessionNextRetryAt = 0;
 
-function getStoredSession(key) {
+function shouldUseRedisSessionStore() {
+  return SESSION_STORE_MODE === 'redis' || SESSION_STORE_MODE === 'auto';
+}
+
+function redisSessionStoreKey(key) {
+  const prefix = REDIS_SESSION_PREFIX.replace(/:+$/, '');
+  return `${prefix}:${key}`;
+}
+
+function redactRedisUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.username) u.username = '***';
+    if (u.password) u.password = '***';
+    return u.toString();
+  } catch {
+    return 'redis://***';
+  }
+}
+
+function logSessionSchemaMiss(key, source, reason) {
+  console.warn(`⚠ Session schema miss: key=${key} source=${source} reason=${reason}`);
+}
+
+function normalizeSessionRecord(rawValue, key, source) {
+  if (!rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) {
+    logSessionSchemaMiss(key, source, 'invalid_type');
+    return null;
+  }
+
+  const schemaVersion = Number(rawValue.schemaVersion);
+  if (schemaVersion !== SESSION_SCHEMA_VERSION) {
+    logSessionSchemaMiss(key, source, `unsupported_schema_version:${String(rawValue.schemaVersion)}`);
+    return null;
+  }
+
+  const sessionId = rawValue.sessionId ? String(rawValue.sessionId) : null;
+  if (!sessionId) {
+    logSessionSchemaMiss(key, source, 'missing_session_id');
+    return null;
+  }
+
+  const timestamp = Number(rawValue.timestamp);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    logSessionSchemaMiss(key, source, 'invalid_timestamp');
+    return null;
+  }
+
+  const turnCountRaw = Number(rawValue.turnCount);
+  const turnCount = Number.isFinite(turnCountRaw) && turnCountRaw > 0 ? Math.floor(turnCountRaw) : 1;
+  const exchangeId = rawValue.exchangeId ? String(rawValue.exchangeId) : null;
+
+  return {
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    sessionId,
+    exchangeId,
+    timestamp,
+    turnCount
+  };
+}
+
+async function initRedisSessionClient() {
+  if (!shouldUseRedisSessionStore()) return null;
+  if (redisSessionClient) return redisSessionClient;
+  if (redisSessionDisabledReason && Date.now() < redisSessionNextRetryAt) return null;
+  if (redisSessionDisabledReason && Date.now() >= redisSessionNextRetryAt) {
+    redisSessionDisabledReason = null;
+  }
+  if (redisSessionInitPromise) return redisSessionInitPromise;
+
+  redisSessionInitPromise = (async () => {
+    if (!REDIS_URL) {
+      redisSessionDisabledReason = 'missing REDIS_URL';
+      redisSessionNextRetryAt = Number.POSITIVE_INFINITY;
+      console.warn(`⚠ Redis session store disabled: ${redisSessionDisabledReason}, fallback to memory`);
+      return null;
+    }
+
+    const client = createClient({
+      url: REDIS_URL,
+      socket: {
+        connectTimeout: REDIS_CONNECT_TIMEOUT_MS
+      }
+    });
+    client.on('error', (err) => {
+      const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+      console.warn(`⚠ Redis session client error: ${safeMessage}`);
+    });
+
+    await client.connect();
+    redisSessionClient = client;
+    redisSessionDisabledReason = null;
+    redisSessionNextRetryAt = 0;
+    console.log(`✅ Redis session store connected: ${redactRedisUrl(REDIS_URL)}`);
+    return redisSessionClient;
+  })().catch((err) => {
+    const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+    redisSessionDisabledReason = safeMessage || 'connect_failed';
+    redisSessionNextRetryAt = Date.now() + 5000;
+    console.warn(`⚠ Redis session store unavailable, fallback to memory: ${safeMessage}`);
+    return null;
+  }).finally(() => {
+    redisSessionInitPromise = null;
+  });
+
+  return redisSessionInitPromise;
+}
+
+async function getStoredSession(key) {
+  if (!key) return null;
+
+  const redisClient = await initRedisSessionClient();
+  if (redisClient) {
+    const rKey = redisSessionStoreKey(key);
+    try {
+      const raw = await redisClient.get(rKey);
+      if (raw == null) {
+        sessionStore.delete(key);
+        return null;
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        logSessionSchemaMiss(key, 'redis', 'invalid_json');
+        sessionStore.delete(key);
+        await redisClient.del(rKey);
+        return null;
+      }
+
+      const record = normalizeSessionRecord(parsed, key, 'redis');
+      if (!record) {
+        sessionStore.delete(key);
+        await redisClient.del(rKey);
+        return null;
+      }
+
+      if (Date.now() - record.timestamp > SESSION_TTL_MS) {
+        sessionStore.delete(key);
+        await redisClient.del(rKey);
+        console.log(`⏰ Session expired for key=${key}`);
+        return null;
+      }
+
+      sessionStore.set(key, record);
+      return record;
+    } catch (err) {
+      const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+      console.warn(`⚠ Redis session read failed, fallback to memory: ${safeMessage}`);
+      redisSessionClient = null;
+      redisSessionDisabledReason = safeMessage || 'read_failed';
+      redisSessionNextRetryAt = Date.now() + 1000;
+    }
+  }
+
   const entry = sessionStore.get(key);
   if (!entry) return null;
-  if (Date.now() - entry.timestamp > SESSION_TTL_MS) {
+  const record = normalizeSessionRecord(entry, key, 'memory');
+  if (!record) {
+    sessionStore.delete(key);
+    return null;
+  }
+  if (Date.now() - record.timestamp > SESSION_TTL_MS) {
     sessionStore.delete(key);
     console.log(`⏰ Session expired for key=${key}`);
     return null;
   }
-  return entry;
+  return record;
 }
 
-function updateStoredSession(key, sessionId, exchangeId) {
-  if (!key) return;
-  const existing = sessionStore.get(key);
+async function updateStoredSession(key, sessionId, exchangeId) {
+  if (!key || !sessionId) return;
+  const existing = await getStoredSession(key);
   const turnCount = existing && existing.sessionId === sessionId ? (existing.turnCount || 0) + 1 : 1;
   const nextExchangeId = exchangeId || ((existing && existing.sessionId === sessionId) ? existing.exchangeId : null);
-  sessionStore.set(key, {
-    sessionId: sessionId || null,
+  const record = {
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    sessionId: String(sessionId),
     exchangeId: nextExchangeId || null,
     timestamp: Date.now(),
     turnCount
-  });
+  };
+
+  sessionStore.set(key, record);
+
+  const redisClient = await initRedisSessionClient();
+  if (redisClient) {
+    const rKey = redisSessionStoreKey(key);
+    try {
+      await redisClient.set(rKey, JSON.stringify(record), { PX: SESSION_TTL_MS });
+    } catch (err) {
+      const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+      console.warn(`⚠ Redis session write failed (key=${key}): ${safeMessage}`);
+      redisSessionClient = null;
+      redisSessionDisabledReason = safeMessage || 'write_failed';
+      redisSessionNextRetryAt = Date.now() + 1000;
+    }
+  }
+
   console.log(`📌 Session stored: key=${key}, sessionId=${sessionId}, exchangeId=${nextExchangeId || 'null'}, turnCount=${turnCount}`);
 }
 
-function clearStoredSession(key) {
+async function clearStoredSession(key) {
   if (!key) return;
   sessionStore.delete(key);
+  const redisClient = await initRedisSessionClient();
+  if (redisClient) {
+    const rKey = redisSessionStoreKey(key);
+    try {
+      await redisClient.del(rKey);
+    } catch (err) {
+      const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+      console.warn(`⚠ Redis session clear failed (key=${key}): ${safeMessage}`);
+      redisSessionClient = null;
+      redisSessionDisabledReason = safeMessage || 'clear_failed';
+      redisSessionNextRetryAt = Date.now() + 1000;
+    }
+  }
   console.log(`🗑 Session cleared: key=${key}`);
 }
 
@@ -1644,7 +1845,7 @@ async function handleChatCompletion(req, res) {
 
     // "new" 表示显式开始新会话
     if (sessionId === 'new') {
-      clearStoredSession(storeKey);
+      await clearStoredSession(storeKey);
       sessionId = null;
       exchangeId = null;
       console.log(`ℹ Client requested new session (key=${storeKey})`);
@@ -1652,7 +1853,7 @@ async function handleChatCompletion(req, res) {
 
     // 如果客户端未提供 session_id，从 store 自动获取（适配 OpenCode 等不支持 session 的客户端）
     if (!sessionId) {
-      const stored = getStoredSession(storeKey);
+      const stored = await getStoredSession(storeKey);
       if (stored && stored.sessionId) {
         sessionId = stored.sessionId;
         if (!exchangeId && stored.exchangeId) {
@@ -1672,7 +1873,7 @@ async function handleChatCompletion(req, res) {
     const clientWantsStream = openaiRequest.stream !== false;
     
     // 获取存储的session信息（用于判断轮次）
-    let storedSession = getStoredSession(storeKey);
+    let storedSession = await getStoredSession(storeKey);
     if (storedSession && sessionId && storedSession.sessionId && storedSession.sessionId !== sessionId) {
       storedSession = null;
     }
@@ -1864,7 +2065,10 @@ async function handleChatCompletion(req, res) {
               if (ids && (ids.sessionId || ids.exchangeId)) {
                 capturedSessionId = ids.sessionId || ids.exchangeId;
                 // 存入 session store，供后续请求自动使用
-                updateStoredSession(storeKey, capturedSessionId, ids.exchangeId);
+                updateStoredSession(storeKey, capturedSessionId, ids.exchangeId).catch((err) => {
+                  const safeMessage = redactSensitiveText(err && err.message ? err.message : String(err));
+                  console.warn(`[${requestId}] Failed to store session from stream: ${safeMessage}`);
+                });
                 if (!res.getHeader('x-session-id')) res.setHeader('x-session-id', capturedSessionId);
               }
             }
@@ -1938,7 +2142,7 @@ async function handleChatCompletion(req, res) {
 
       // 更新 session store
       if (upstreamSessionId) {
-        updateStoredSession(storeKey, upstreamSessionId, upstreamExchangeId);
+        await updateStoredSession(storeKey, upstreamSessionId, upstreamExchangeId);
       }
       if (upstreamSessionId && !res.getHeader('x-session-id')) {
         res.setHeader('x-session-id', upstreamSessionId);
@@ -2149,4 +2353,5 @@ app.listen(PORT, () => {
   console.log(`mix2api adapter running on port ${PORT}`);
   console.log(`Access at: http://localhost:${PORT}`);
   console.log(`OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
+  void initRedisSessionClient();
 });

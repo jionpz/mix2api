@@ -2,8 +2,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
-const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
+const { spawn, spawnSync } = require('node:child_process');
 const path = require('node:path');
+const { createClient } = require('redis');
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -40,6 +42,78 @@ async function stopProc(proc) {
 
   proc.kill('SIGKILL');
   await waitForExit(proc, 1000);
+}
+
+const HAS_REDIS_SERVER = (() => {
+  try {
+    const probe = spawnSync('redis-server', ['--version'], { encoding: 'utf8' });
+    return probe.status === 0;
+  } catch {
+    return false;
+  }
+})();
+
+async function waitForRedisReady({ port, timeoutMs }) {
+  const deadline = Date.now() + timeoutMs;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await new Promise((resolve, reject) => {
+        const socket = net.createConnection({ host: '127.0.0.1', port });
+        socket.once('connect', () => {
+          socket.end();
+          resolve();
+        });
+        socket.once('error', reject);
+      });
+      return;
+    } catch {
+      // ignore
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`redis did not become ready within ${timeoutMs}ms on 127.0.0.1:${port}`);
+    }
+    await sleep(50);
+  }
+}
+
+async function startRedisServer(port) {
+  if (!HAS_REDIS_SERVER) {
+    throw new Error('redis-server binary not found');
+  }
+  const proc = spawn('redis-server', [
+    '--save', '',
+    '--appendonly', 'no',
+    '--port', String(port),
+    '--bind', '127.0.0.1'
+  ], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  await waitForRedisReady({ port, timeoutMs: 5000 });
+  return proc;
+}
+
+function sanitizeKeyPartForTest(value, fallback = 'unknown') {
+  const s = String(value || '').trim().toLowerCase();
+  if (!s) return fallback;
+  const normalized = s.replace(/[^a-z0-9._:-]/g, '_').slice(0, 80);
+  return normalized || fallback;
+}
+
+function inferClientIdForTest(headers) {
+  const explicitClient = headers['x-client'] || headers['x-client-id'] || headers['x-client_name'];
+  if (explicitClient) return sanitizeKeyPartForTest(explicitClient, 'unknown');
+  const ua = String(headers['user-agent'] || '').toLowerCase();
+  if (ua.includes('opencode')) return 'opencode';
+  if (ua.includes('claude code') || ua.includes('claude-code') || ua.includes('claudecode')) return 'claude-code';
+  return 'unknown';
+}
+
+function getSessionStoreKeyForTest({ model, token, headers }) {
+  const modelPart = sanitizeKeyPartForTest(model || '_default', '_default');
+  const authPart = crypto.createHash('sha256').update(String(token || '')).digest('hex').slice(0, 12);
+  const clientPart = inferClientIdForTest(headers || {});
+  return `${authPart}::${modelPart}::${clientPart}`;
 }
 
 async function waitForHealthy({ port, timeoutMs }) {
@@ -954,4 +1028,138 @@ test('POST /v1/chat/completions with managed auth refreshes token and retries af
   const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
   assert.equal(logs.includes(expiredToken), false);
   assert.equal(logs.includes(freshToken), false);
+});
+
+test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
+  if (!HAS_REDIS_SERVER) {
+    t.skip('redis-server not available in test environment');
+    return;
+  }
+
+  const redisPort = await getFreePort();
+  const upstreamPort = await getFreePort();
+  const adapterPortA = await getFreePort();
+  const adapterPortB = await getFreePort();
+  const redisProc = await startRedisServer(redisPort);
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const sharedEnv = {
+    SESSION_STORE_MODE: 'redis',
+    REDIS_URL: `redis://127.0.0.1:${redisPort}`
+  };
+  const adapterA = await startAdapter({ port: adapterPortA, upstreamPort, env: sharedEnv });
+  const adapterB = await startAdapter({ port: adapterPortB, upstreamPort, env: sharedEnv });
+
+  t.after(async () => {
+    await stopProc(adapterA);
+    await stopProc(adapterB);
+    await closeServer(upstreamServer);
+    await stopProc(redisProc);
+  });
+
+  const headers = {
+    'content-type': 'application/json',
+    authorization: 'Bearer inbound-test-token',
+    'user-agent': 'OpenCode/1.0'
+  };
+  const body = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    messages: [{ role: 'user', content: 'redis shared session continuity' }]
+  };
+
+  const first = await fetch(`http://127.0.0.1:${adapterPortA}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  });
+  assert.equal(first.status, 200);
+
+  await sleep(80);
+
+  const second = await fetch(`http://127.0.0.1:${adapterPortB}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  });
+  assert.equal(second.status, 200);
+
+  const chatRequests = requests.filter((item) => item.url === '/v2/chats');
+  assert.equal(chatRequests.length, 2);
+  assert.equal(chatRequests[0].body?.session_id, undefined);
+  assert.equal(chatRequests[1].body?.session_id, 'sess-json');
+  assert.equal(chatRequests[1].body?.exchange_id, 'ex-json');
+});
+
+test('POST /v1/chat/completions treats unknown schemaVersion in redis as miss and recreates session mapping', async (t) => {
+  if (!HAS_REDIS_SERVER) {
+    t.skip('redis-server not available in test environment');
+    return;
+  }
+
+  const redisPort = await getFreePort();
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const redisProc = await startRedisServer(redisPort);
+  const redisClient = createClient({ url: `redis://127.0.0.1:${redisPort}` });
+  await redisClient.connect();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      SESSION_STORE_MODE: 'redis',
+      REDIS_URL: `redis://127.0.0.1:${redisPort}`
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+    await redisClient.quit();
+    await stopProc(redisProc);
+  });
+
+  const headers = {
+    'content-type': 'application/json',
+    authorization: 'Bearer inbound-test-token',
+    'user-agent': 'OpenCode/1.0'
+  };
+  const model = 'mix/qwen-3-235b-instruct';
+  const body = {
+    model,
+    stream: false,
+    messages: [{ role: 'user', content: 'schema downgrade as miss' }]
+  };
+
+  const storeKey = getSessionStoreKeyForTest({
+    model,
+    token: 'inbound-test-token',
+    headers
+  });
+  const redisSessionKey = `mix2api:session:${storeKey}`;
+  await redisClient.set(redisSessionKey, JSON.stringify({
+    schemaVersion: 999,
+    sessionId: 'sess-corrupted',
+    exchangeId: 'ex-corrupted',
+    timestamp: Date.now(),
+    turnCount: 5
+  }), { PX: 60000 });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  });
+  assert.equal(res.status, 200);
+
+  const chatRequests = requests.filter((item) => item.url === '/v2/chats');
+  assert.equal(chatRequests.length, 1);
+  assert.equal(chatRequests[0].body?.session_id, undefined);
+  assert.equal(chatRequests[0].body?.exchange_id, undefined);
+
+  const recoveredRaw = await redisClient.get(redisSessionKey);
+  assert.ok(recoveredRaw);
+  const recovered = JSON.parse(recoveredRaw);
+  assert.equal(recovered?.schemaVersion, 1);
+  assert.equal(recovered?.sessionId, 'sess-json');
 });
