@@ -36,6 +36,7 @@ outputs:
   story_2_4: '_bmad-output/implementation-artifacts/2-4-redis-共享状态与-schemaversion-降级机制.md'
   story_3_1: '_bmad-output/implementation-artifacts/3-1-request-id-贯通与排障关联头.md'
   story_3_2: '_bmad-output/implementation-artifacts/3-2-sse-稳定输出与完成信号.md'
+  story_3_3: '_bmad-output/implementation-artifacts/3-3-流式终止分型与-end-reason-归因.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -75,3 +76,5 @@ notes:
   - 'Created Story 3.2 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 3.2 and moved it to review on 2026-02-11.'
   - 'Story 3.2 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 3.3 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 3.3 and moved it to review on 2026-02-11.'

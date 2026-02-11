@@ -28,6 +28,8 @@ app.use((req, res, next) => {
   const requestId = normalizeRequestId(headerValue) || uuidv4();
   req.requestId = requestId;
   res.locals.requestId = requestId;
+  res.locals.endReason = 'unknown';
+  res.locals.upstreamStatus = null;
   res.setHeader('x-request-id', requestId);
   next();
 });
@@ -95,6 +97,17 @@ function redactSensitiveText(text) {
   return output;
 }
 
+function setRequestEndReason(res, reason) {
+  if (!res || !res.locals || !reason) return;
+  res.locals.endReason = String(reason);
+}
+
+function setRequestUpstreamStatus(res, status) {
+  if (!res || !res.locals) return;
+  if (status === undefined || status === null || status === '') return;
+  res.locals.upstreamStatus = Number.isFinite(Number(status)) ? Number(status) : String(status);
+}
+
 function base64UrlToJson(b64url) {
   try {
     let s = String(b64url || '');
@@ -137,7 +150,9 @@ app.use((req, res, next) => {
   }
   res.on('finish', () => {
     const durationMs = Date.now() - startedAt;
-    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed status=${res.statusCode} duration_ms=${durationMs}`);
+    const endReason = res.locals && res.locals.endReason ? res.locals.endReason : 'unknown';
+    const upstreamStatus = res.locals && res.locals.upstreamStatus != null ? res.locals.upstreamStatus : 'none';
+    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed status=${res.statusCode} duration_ms=${durationMs} end_reason=${endReason} upstream_status=${upstreamStatus}`);
   });
   next();
 });
@@ -1702,6 +1717,8 @@ function sendOpenAIError(res, status, {
 
 // 处理聊天完成请求的函数
 async function handleChatCompletion(req, res) {
+  const requestId = req.requestId || String(res.getHeader('x-request-id') || uuidv4());
+  if (!res.getHeader('x-request-id')) res.setHeader('x-request-id', requestId);
   try {
     const openaiRequest = req.body;
     const authHeader = req.headers['authorization'];
@@ -1710,13 +1727,12 @@ async function handleChatCompletion(req, res) {
     const expectedInboundToken = process.env.INBOUND_BEARER_TOKEN || null;
     const staticUpstreamToken = process.env.UPSTREAM_BEARER_TOKEN || null;
 
-    const requestId = req.requestId || String(res.getHeader('x-request-id') || uuidv4());
-    if (!res.getHeader('x-request-id')) res.setHeader('x-request-id', requestId);
     const streamId = `chatcmpl-${uuidv4()}`;
     
     let inboundToken = null;
     if (inboundAuthMode !== 'none') {
       if (!authHeader) {
+        setRequestEndReason(res, 'auth_error');
         return sendOpenAIError(res, 401, {
           message: 'Missing authorization header',
           type: 'authentication_error',
@@ -1728,6 +1744,7 @@ async function handleChatCompletion(req, res) {
       // 提取 Bearer token
       const m = String(authHeader).match(/^\s*Bearer\s+(.+)\s*$/i);
       if (!m) {
+        setRequestEndReason(res, 'auth_error');
         return sendOpenAIError(res, 401, {
           message: 'Invalid authorization header (expected Bearer token)',
           type: 'authentication_error',
@@ -1738,6 +1755,7 @@ async function handleChatCompletion(req, res) {
       inboundToken = m[1];
 
       if (expectedInboundToken && inboundToken !== expectedInboundToken) {
+        setRequestEndReason(res, 'auth_error');
         return sendOpenAIError(res, 401, {
           message: 'Invalid inbound token',
           type: 'authentication_error',
@@ -1749,6 +1767,7 @@ async function handleChatCompletion(req, res) {
 
     // 基本请求校验（避免后续 NPE）
     if (!openaiRequest || typeof openaiRequest !== 'object') {
+      setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request body',
         type: 'invalid_request_error',
@@ -1757,6 +1776,7 @@ async function handleChatCompletion(req, res) {
       });
     }
     if (typeof openaiRequest.model !== 'string' || !openaiRequest.model.trim()) {
+      setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request: model must be a non-empty string',
         type: 'invalid_request_error',
@@ -1765,6 +1785,7 @@ async function handleChatCompletion(req, res) {
       });
     }
     if (!Array.isArray(openaiRequest.messages) || openaiRequest.messages.length === 0) {
+      setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request: messages must be a non-empty array',
         type: 'invalid_request_error',
@@ -1776,6 +1797,7 @@ async function handleChatCompletion(req, res) {
     let upstreamToken = null;
     if (upstreamAuthMode === 'pass_through') {
       if (!inboundToken) {
+        setRequestEndReason(res, 'adapter_error');
         return sendOpenAIError(res, 500, {
           message: 'Invalid server config: UPSTREAM_AUTH_MODE=pass_through requires inbound Bearer token',
           type: 'server_error',
@@ -1786,6 +1808,7 @@ async function handleChatCompletion(req, res) {
       upstreamToken = inboundToken;
     } else if (upstreamAuthMode === 'static') {
       if (!staticUpstreamToken) {
+        setRequestEndReason(res, 'adapter_error');
         return sendOpenAIError(res, 500, {
           message: 'Invalid server config: UPSTREAM_AUTH_MODE=static requires UPSTREAM_BEARER_TOKEN',
           type: 'server_error',
@@ -1798,6 +1821,7 @@ async function handleChatCompletion(req, res) {
       try {
         upstreamToken = await getManagedUpstreamToken({ requestId, forceRefresh: false });
       } catch (error) {
+        setRequestEndReason(res, 'upstream_error');
         return sendOpenAIError(res, 502, {
           message: error && error.message ? error.message : 'Failed to obtain upstream token',
           type: 'api_error',
@@ -1808,6 +1832,7 @@ async function handleChatCompletion(req, res) {
     } else if (upstreamAuthMode === 'none') {
       upstreamToken = null;
     } else {
+      setRequestEndReason(res, 'adapter_error');
       return sendOpenAIError(res, 500, {
         message: `Invalid UPSTREAM_AUTH_MODE: ${upstreamAuthMode}`,
         type: 'server_error',
@@ -1829,6 +1854,7 @@ async function handleChatCompletion(req, res) {
 
           if (exp < now) {
             console.error('❌ Token已过期！');
+            setRequestEndReason(res, 'upstream_error');
             return res.status(401).json({
               error: {
                 message: 'Token expired',
@@ -2002,11 +2028,13 @@ async function handleChatCompletion(req, res) {
     
     // 调用上游
     const response = await fetchUpstreamWithAuthRecovery();
+    setRequestUpstreamStatus(res, response.status);
     console.log(`[${requestId}] Upstream Response: status=${response.status}, content-type=${response.headers.get('content-type')}`);
     
     if (!response.ok) {
       const error = await response.text();
       console.error(`[${requestId}] Upstream API Error:`, redactSensitiveText(error));
+      setRequestEndReason(res, 'upstream_error');
       return sendOpenAIError(res, response.status, {
         message: `Upstream API error: ${response.statusText || response.status}`,
         type: 'api_error',
@@ -2043,6 +2071,30 @@ async function handleChatCompletion(req, res) {
       // 读取上游的流式响应并转换为 OpenAI 格式
       const reader = response.body;
       let buffer = '';
+      let streamEndReason = 'unknown';
+      let clientAborted = false;
+
+      const finalizeStreamEndReason = (reason) => {
+        if (!reason || streamEndReason !== 'unknown') return;
+        streamEndReason = reason;
+        setRequestEndReason(res, reason);
+        console.log(`[${requestId}] stream.terminated end_reason=${reason} upstream_status=${response.status}`);
+      };
+
+      const handleClientAbort = () => {
+        if (clientAborted) return;
+        if (res.writableEnded) return;
+        clientAborted = true;
+        finalizeStreamEndReason('client_abort');
+        if (reader && typeof reader.destroy === 'function' && !reader.destroyed) {
+          reader.destroy();
+        }
+      };
+
+      req.once('aborted', handleClientAbort);
+      res.once('close', () => {
+        if (!res.writableEnded) handleClientAbort();
+      });
       
       reader.on('data', (chunk) => {
         buffer += chunk.toString();
@@ -2115,12 +2167,20 @@ async function handleChatCompletion(req, res) {
       });
       
       reader.on('end', () => {
+        finalizeStreamEndReason('stop');
         if (!sentAny) flushPending();
         if (!doneSent) res.write('data: [DONE]\n\n');
         res.end();
       });
       
       reader.on('error', (error) => {
+        if (clientAborted) return;
+        const msg = String(error && error.message ? error.message : error);
+        if (msg.toLowerCase().includes('aborted') || msg.toLowerCase().includes('timeout')) {
+          finalizeStreamEndReason('timeout');
+        } else {
+          finalizeStreamEndReason('upstream_error');
+        }
         console.error('Stream error:', error);
         res.end();
       });
@@ -2142,6 +2202,7 @@ async function handleChatCompletion(req, res) {
         if (upstreamError) {
           const safeUpstreamError = redactSensitiveText(upstreamError);
           console.error(`[${requestId}] ❌ Upstream error:`, safeUpstreamError);
+          setRequestEndReason(res, 'upstream_error');
           return sendOpenAIError(res, 502, {
             message: `Upstream error: ${safeUpstreamError}`,
             type: 'api_error',
@@ -2198,8 +2259,10 @@ async function handleChatCompletion(req, res) {
               res.setHeader('Content-Type', 'text/event-stream');
               res.setHeader('Cache-Control', 'no-cache');
               res.setHeader('Connection', 'keep-alive');
+              setRequestEndReason(res, 'stop');
               return writeFinalStream(res, streamId, openaiRequest.model, fallbackText);
             }
+            setRequestEndReason(res, 'stop');
             return res.json({
               id: `chatcmpl-${uuidv4()}`,
               session_id: upstreamSessionId || sessionId || null,
@@ -2227,8 +2290,10 @@ async function handleChatCompletion(req, res) {
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
+            setRequestEndReason(res, 'tool_calls');
             return writeToolCallStream(res, streamId, openaiRequest.model, validToolCalls);
           }
+          setRequestEndReason(res, 'tool_calls');
           return res.json({
             id: `chatcmpl-${uuidv4()}`,
             session_id: upstreamSessionId || sessionId || null,
@@ -2264,8 +2329,10 @@ async function handleChatCompletion(req, res) {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
+          setRequestEndReason(res, 'stop');
           return writeFinalStream(res, streamId, openaiRequest.model, finalText);
         }
+        setRequestEndReason(res, 'stop');
         return res.json({
           id: `chatcmpl-${uuidv4()}`,
           session_id: upstreamSessionId || sessionId || null,
@@ -2295,9 +2362,11 @@ async function handleChatCompletion(req, res) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        setRequestEndReason(res, 'stop');
         return writeFinalStream(res, streamId, openaiRequest.model, finalText);
       }
 
+      setRequestEndReason(res, 'stop');
       return res.json({
         id: `chatcmpl-${uuidv4()}`,
         session_id: upstreamSessionId || sessionId || null,
@@ -2324,6 +2393,7 @@ async function handleChatCompletion(req, res) {
     const isAbort = error && (error.name === 'AbortError' || error.type === 'aborted' || String(error.message || '').toLowerCase().includes('aborted'));
     if (isAbort) {
       console.warn('Upstream request aborted (timeout):', error && error.message ? error.message : String(error));
+      setRequestEndReason(res, 'timeout');
       return sendOpenAIError(res, 504, {
         message: 'Upstream timeout',
         type: 'api_error',
@@ -2334,6 +2404,7 @@ async function handleChatCompletion(req, res) {
 
     const safeError = redactSensitiveText(error && error.message ? error.message : String(error));
     console.error('Adapter error:', safeError);
+    setRequestEndReason(res, 'adapter_error');
     const expose = envBool('EXPOSE_STACK', false);
     return sendOpenAIError(res, 500, {
       message: safeError || 'Internal server error',

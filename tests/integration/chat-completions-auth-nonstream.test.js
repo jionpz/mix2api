@@ -140,7 +140,9 @@ async function startMockUpstream(port, {
   omitSessionStart = false,
   forceStatus = null,
   forceBusinessError = false,
-  streamDelayAfterFirstDeltaMs = 0
+  streamDelayAfterFirstDeltaMs = 0,
+  delayBeforeAnyResponseMs = 0,
+  forceStreamDropAfterFirstDelta = false
 } = {}) {
   const requests = [];
   const server = http.createServer(async (req, res) => {
@@ -165,52 +167,64 @@ async function startMockUpstream(port, {
       });
 
       if (req.method === 'POST' && req.url === '/v2/chats') {
-        if (forceStatus !== null) {
-          res.writeHead(forceStatus, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'mocked upstream failure' } }));
-          return;
-        }
+        const handleChat = () => {
+          if (forceStatus !== null) {
+            res.writeHead(forceStatus, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'mocked upstream failure' } }));
+            return;
+          }
 
-        if (forceBusinessError) {
+          if (forceBusinessError) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'mocked upstream business error' } }));
+            return;
+          }
+
+          if (!forceJsonForStream && parsedBody && parsedBody.stream === true) {
+            res.writeHead(200, { 'content-type': 'text/event-stream' });
+            if (!omitSessionStart) {
+              res.write(`data: ${JSON.stringify({
+                type: 'start',
+                messageMetadata: {
+                  sessionId: 'sess-stream',
+                  exchangeId: 'ex-stream'
+                }
+              })}\n\n`);
+            }
+            res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'mocked ' })}\n\n`);
+            if (forceStreamDropAfterFirstDelta) {
+              res.destroy(new Error('mock upstream stream dropped'));
+              return;
+            }
+            const writeRest = () => {
+              res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'stream answer' })}\n\n`);
+              res.write(`data: ${JSON.stringify({ type: 'finish' })}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
+            };
+            if (streamDelayAfterFirstDeltaMs > 0) {
+              setTimeout(writeRest, streamDelayAfterFirstDeltaMs);
+            } else {
+              writeRest();
+            }
+            return;
+          }
+
           res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'mocked upstream business error' } }));
-          return;
-        }
+          res.end(JSON.stringify({
+            content: 'mocked upstream answer',
+            messageMetadata: {
+              sessionId: 'sess-json',
+              exchangeId: 'ex-json'
+            }
+          }));
+        };
 
-        if (!forceJsonForStream && parsedBody && parsedBody.stream === true) {
-          res.writeHead(200, { 'content-type': 'text/event-stream' });
-          if (!omitSessionStart) {
-            res.write(`data: ${JSON.stringify({
-              type: 'start',
-              messageMetadata: {
-                sessionId: 'sess-stream',
-                exchangeId: 'ex-stream'
-              }
-            })}\n\n`);
-          }
-          res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'mocked ' })}\n\n`);
-          const writeRest = () => {
-            res.write(`data: ${JSON.stringify({ type: 'text-delta', delta: 'stream answer' })}\n\n`);
-            res.write(`data: ${JSON.stringify({ type: 'finish' })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-          };
-          if (streamDelayAfterFirstDeltaMs > 0) {
-            setTimeout(writeRest, streamDelayAfterFirstDeltaMs);
-          } else {
-            writeRest();
-          }
-          return;
+        if (delayBeforeAnyResponseMs > 0) {
+          setTimeout(handleChat, delayBeforeAnyResponseMs);
+        } else {
+          handleChat();
         }
-
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
-          content: 'mocked upstream answer',
-          messageMetadata: {
-            sessionId: 'sess-json',
-            exchangeId: 'ex-json'
-          }
-        }));
         return;
       }
 
@@ -1157,6 +1171,132 @@ test('POST /v1/chat/completions regenerates invalid inbound x-request-id', async
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].headers['x-request-id'], generatedRequestId);
+});
+
+test('POST /v1/chat/completions stream timeout is classified as end_reason=timeout', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    delayBeforeAnyResponseMs: 500
+  });
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      UPSTREAM_TIMEOUT_MS: '80',
+      UPSTREAM_RETRY_COUNT: '0'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      messages: [{ role: 'user', content: 'trigger timeout end_reason' }]
+    })
+  });
+
+  assert.equal(res.status, 504);
+  const body = await res.json();
+  assert.equal(body?.error?.code, 'upstream_timeout');
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /request\.completed[^\n]*end_reason=timeout/);
+});
+
+test('POST /v1/chat/completions stream upstream HTTP error is classified as end_reason=upstream_error', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, { forceStatus: 503 });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      messages: [{ role: 'user', content: 'trigger upstream error end_reason' }]
+    })
+  });
+
+  assert.equal(res.status, 503);
+  const json = await res.json();
+  assert.equal(json?.error?.code, 'upstream_http_error');
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /request\.completed[^\n]*end_reason=upstream_error/);
+  assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
+});
+
+test('POST /v1/chat/completions stream client abort is classified as end_reason=client_abort', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    omitSessionStart: true,
+    streamDelayAfterFirstDeltaMs: 900
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const controller = new AbortController();
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    signal: controller.signal,
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      messages: [{ role: 'user', content: 'abort stream from client side' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  assert.equal(first.done, false);
+  controller.abort();
+  try {
+    await reader.read();
+  } catch {
+    // expected when client aborts
+  }
+
+  await sleep(200);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /stream\.terminated end_reason=client_abort/);
+
+  // abort 后服务仍应可用
+  const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+  assert.equal(health.status, 200);
 });
 
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
