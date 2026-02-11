@@ -1773,6 +1773,47 @@ test('POST /v1/chat/completions rejects mismatched tool_call_id in tool backfill
   assert.equal(requests.length, 0);
 });
 
+test('POST /v1/chat/completions ignores non-function tools (MCP-safe) when filtering tool_calls', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: JSON.stringify({
+      tool_calls: [{ name: 'mcp_tool', arguments: { q: 'x' } }],
+      final: 'mcp tools are client-side only'
+    })
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [{
+        type: 'mcp',
+        name: 'mcp_tool',
+        description: 'MCP tool descriptor (should not be treated as OpenAI function tool)'
+      }],
+      messages: [{ role: 'user', content: 'try to call mcp tool' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].finish_reason, 'stop');
+  assert.equal(typeof json.choices[0].message.content, 'string');
+  assert.match(json.choices[0].message.content, /mcp tools are client-side only/);
+});
+
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
   if (!HAS_REDIS_SERVER) {
     t.skip('redis-server not available in test environment');

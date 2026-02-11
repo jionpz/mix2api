@@ -1227,7 +1227,9 @@ function normalizeOpenAIRequestTooling(input) {
             }
           };
         }
-        if (typeof tool.name === 'string' && tool.name.trim()) {
+        // 兼容旧格式：tools 里直接传 function schema（没有 type/function 外壳）。
+        // 注意：不要把非 function 的 tools（如 MCP 描述符 type="mcp"）误判为 function。
+        if ((!tool.type || tool.type === 'function') && typeof tool.name === 'string' && tool.name.trim()) {
           return {
             type: 'function',
             function: {
@@ -1622,10 +1624,18 @@ function validateAndFilterToolCalls(toolCalls, validTools) {
   }
   
   const validToolNames = new Set();
-  validTools.forEach(tool => {
+  validTools.forEach((tool) => {
+    if (!tool) return;
+    // MCP-safe: 仅认可 function tools；忽略 type != function 的工具描述符（例如 type="mcp"）。
+    if (tool.type && tool.type !== 'function') return;
     const fn = tool.function || tool;
-    if (fn.name) validToolNames.add(fn.name);
+    if (fn && fn.name) validToolNames.add(fn.name);
   });
+
+  if (validToolNames.size === 0) {
+    // 请求虽带 tools，但没有任何可识别的 function 工具：不允许上游返回 tool_calls 落到客户端。
+    return [];
+  }
   
   const filtered = toolCalls.filter(call => {
     if (validToolNames.has(call.name)) {

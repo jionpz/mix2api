@@ -41,6 +41,7 @@ outputs:
   story_4_1: '_bmad-output/implementation-artifacts/4-1-tools-与-legacy-functions-入参兼容.md'
   story_4_2: '_bmad-output/implementation-artifacts/4-2-tool-calls-输出与-tool-call-id-一致性.md'
   story_4_3: '_bmad-output/implementation-artifacts/4-3-tool-结果回填与继续生成闭环.md'
+  story_4_4: '_bmad-output/implementation-artifacts/4-4-mcp-safe-透传与服务端执行隔离.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -95,3 +96,5 @@ notes:
   - 'Created Story 4.3 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 4.3 and moved it to review on 2026-02-11.'
   - 'Story 4.3 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 4.4 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 4.4 and moved it to review on 2026-02-11.'
