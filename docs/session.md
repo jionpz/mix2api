@@ -5,6 +5,7 @@
 ## 关键结论
 
 - 上游会在响应的 START 帧/metadata 中返回 `sessionId`（以及可能的 `exchangeId`）。
+- 首轮请求（当前会话 key 为 miss）由上游负责创建会话，`mix2api` 不透传客户端传入的 `session_id` / `exchange_id`。
 - `mix2api` 会优先使用 `sessionId` 作为后续请求的 `session_id`。
 - 如果上游没有提供 `sessionId`，才会回退使用 `exchangeId`。
 

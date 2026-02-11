@@ -73,6 +73,7 @@ GPT-5 (Codex)
 
 - README 增补接入、鉴权、灰度回滚与回归包 A/B/C 指南。
 - 新增 OpenAPI 3.0.3 契约文档，覆盖核心端点并给出流式/错误示例。
+- 文档补充会话引导规则：首个 `session_id` 由首次上游响应返回，store miss 时不透传客户端 `session_id`。
 
 ### File List
 
@@ -86,6 +87,7 @@ GPT-5 (Codex)
 
 - 2026-02-11: 实现 Story 5.3（接入文档与 OpenAPI 契约文档交付）：补齐 README 接入指引并新增 OpenAPI 文档。
 - 2026-02-11: 完成 Story 5.3 代码审查并通过，状态由 review 更新为 done。
+- 2026-02-12: 根据 Correct Course 修订 README/OpenAPI/session 文档中的 session bootstrap 语义（上游回传主导）。
 
 ## Senior Developer Review (AI)
 

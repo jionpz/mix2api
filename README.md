@@ -67,6 +67,12 @@ curl -sS http://127.0.0.1:3001/v1/models
 - `REDIS_URL=redis://<host>:6379`
 - 可选 `REDIS_SESSION_PREFIX` 自定义前缀
 
+会话引导规则（重要）：
+
+- 首次请求（当前会话键无缓存）时，`mix2api` 不会向上游透传客户端传入的 `session_id` / `exchange_id`。
+- 第一个可复用 `session_id` 由上游响应返回，适配器写入 session store 后用于后续请求。
+- 如需强制开启新会话，使用 `session_id: "new"`（或 header `x-session-id: new`）。
+
 ## 4. 灰度与回滚建议
 
 推荐放量：`0% -> 5% -> 20% -> 50% -> 100%`。每一档至少观察 10 分钟。

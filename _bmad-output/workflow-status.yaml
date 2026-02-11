@@ -1,7 +1,7 @@
 ---
 project_name: mix2api
 last_updated: '2026-02-12'
-current_workflow: 'retrospective'
+current_workflow: 'correct-course'
 completed_workflows:
   - brainstorming
   - research-domain
@@ -16,6 +16,7 @@ completed_workflows:
   - create-story
   - dev-story
   - retrospective
+  - correct-course
 outputs:
   brainstorming: '_bmad-output/brainstorming/brainstorming-session-2026-02-10.md'
   research_domain: '_bmad-output/planning-artifacts/research/domain-LLM网关-OpenAIChatCompletions兼容适配层-new-api生态-MCP工具调用生态-research-2026-02-10.md'
@@ -53,6 +54,7 @@ outputs:
   story_5_4: '_bmad-output/implementation-artifacts/5-4-回归包-a-b-c-与发布门禁流程.md'
   retrospective_epic_5: '_bmad-output/implementation-artifacts/epic-5-retro-2026-02-11.md'
   release_readiness_2026_02_12: '_bmad-output/implementation-artifacts/release-readiness-2026-02-12.md'
+  sprint_change_proposal_2026_02_12: '_bmad-output/planning-artifacts/sprint-change-proposal-2026-02-12.md'
 next_recommended:
   - sprint-status
 notes:
@@ -128,3 +130,4 @@ notes:
   - 'Completed Epic 3 retrospective and marked epic-3-retrospective as done on 2026-02-12.'
   - 'Completed Epic 4 retrospective and marked epic-4-retrospective as done on 2026-02-12.'
   - 'Created release readiness handoff with gate/test evidence on 2026-02-12.'
+  - 'Executed correct-course and implemented upstream-authoritative session bootstrap behavior on 2026-02-12.'

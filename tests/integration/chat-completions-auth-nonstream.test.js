@@ -904,7 +904,7 @@ test('POST /v1/chat/completions with malformed JSON returns 400 OpenAI error env
   assert.equal(requests.length, 0);
 });
 
-test('POST /v1/chat/completions reuses explicitly provided session_id across turns', async (t) => {
+test('POST /v1/chat/completions bootstraps first session_id from upstream even when client provides one', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();
   const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
@@ -922,29 +922,50 @@ test('POST /v1/chat/completions reuses explicitly provided session_id across tur
     'user-agent': 'OpenCode/1.0'
   };
 
-  const requestBody = {
+  const firstTurnBody = {
     model: 'mix/qwen-3-235b-instruct',
     stream: false,
     session_id: explicitSessionId,
-    messages: [{ role: 'user', content: 'keep this explicit session' }]
+    exchange_id: 'ex-explicit-999',
+    messages: [{ role: 'user', content: 'first turn should be bootstrapped by upstream session' }]
+  };
+  const secondTurnBody = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    messages: [{ role: 'user', content: 'second turn should auto reuse upstream session' }]
+  };
+  const thirdTurnBody = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    session_id: 'sess-json',
+    messages: [{ role: 'user', content: 'explicit session can be reused after bootstrap' }]
   };
 
   const first = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(firstTurnBody)
   });
   const second = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
     method: 'POST',
     headers,
-    body: JSON.stringify(requestBody)
+    body: JSON.stringify(secondTurnBody)
+  });
+  const third = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(thirdTurnBody)
   });
 
   assert.equal(first.status, 200);
   assert.equal(second.status, 200);
-  assert.equal(requests.length, 2);
-  assert.equal(requests[0].body?.session_id, explicitSessionId);
-  assert.equal(requests[1].body?.session_id, explicitSessionId);
+  assert.equal(third.status, 200);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[0].body?.session_id, undefined);
+  assert.equal(requests[0].body?.exchange_id, undefined);
+  assert.equal(requests[1].body?.session_id, 'sess-json');
+  assert.equal(requests[1].body?.exchange_id, 'ex-json');
+  assert.equal(requests[2].body?.session_id, 'sess-json');
 });
 
 test('POST /v1/chat/completions isolates auto-session by auth+model+client key', async (t) => {

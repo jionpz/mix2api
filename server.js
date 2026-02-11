@@ -2206,10 +2206,9 @@ async function handleChatCompletion(req, res) {
       }
     }
     
-    // session_id 获取优先级：
-    // 1. 客户端显式传入（header / body）
-    // 2. 适配器自动管理的 session store（OpenCode 不会传 session，所以这是主要来源）
-    // 3. 无 session → 上游创建新会话
+    // session_id 获取策略：
+    // 1. 首轮引导（store miss）：忽略客户端传入的 session/exchange，由上游创建并回传首个 session
+    // 2. 会话已建立（store hit）：可复用显式 session，或由 store 自动补齐
     const sessionIdFromHeader = req.headers['x-session-id'] || req.headers['x-session_id'] || null;
     const sessionIdFromBody = openaiRequest && (
       openaiRequest.session_id
@@ -2234,15 +2233,31 @@ async function handleChatCompletion(req, res) {
       console.log(`ℹ Client requested new session (key=${storeKey})`);
     }
 
-    // 如果客户端未提供 session_id，从 store 自动获取（适配 OpenCode 等不支持 session 的客户端）
-    if (!sessionId) {
-      const stored = await getStoredSession(storeKey);
-      if (stored && stored.sessionId) {
-        sessionId = stored.sessionId;
-        if (!exchangeId && stored.exchangeId) {
-          exchangeId = stored.exchangeId;
+    // 获取存储的session信息（用于判断轮次与引导策略）
+    let storedSession = await getStoredSession(storeKey);
+
+    if (!storedSession || !storedSession.sessionId) {
+      // bootstrap 阶段：首个 session_id 必须由上游响应产生
+      if (sessionId || exchangeId) {
+        console.log(`ℹ Session bootstrap: ignore client-provided session/exchange and request new upstream session (key=${storeKey})`);
+      }
+      sessionId = null;
+      exchangeId = null;
+    } else {
+      // 会话已建立：允许自动复用 store，或使用客户端显式 session
+      if (!sessionId) {
+        sessionId = storedSession.sessionId;
+        if (!exchangeId && storedSession.exchangeId) {
+          exchangeId = storedSession.exchangeId;
         }
         console.log(`ℹ Auto-session from store: session_fp=${fingerprint(sessionId)} (key=${storeKey})`);
+      }
+      if (storedSession && sessionId && storedSession.sessionId && storedSession.sessionId !== sessionId) {
+        // 显式 session 与 store 不一致时，不将当前请求计入已建立会话轮次
+        storedSession = null;
+      }
+      if (storedSession && !exchangeId && storedSession.exchangeId) {
+        exchangeId = storedSession.exchangeId;
       }
     }
 
@@ -2253,15 +2268,6 @@ async function handleChatCompletion(req, res) {
       || (openaiRequest && (openaiRequest.persona_id || openaiRequest.personaId))
       || (openaiRequest && openaiRequest.request && (openaiRequest.request.persona_id || openaiRequest.request.personaId))
     ) || null;
-    
-    // 获取存储的session信息（用于判断轮次）
-    let storedSession = await getStoredSession(storeKey);
-    if (storedSession && sessionId && storedSession.sessionId && storedSession.sessionId !== sessionId) {
-      storedSession = null;
-    }
-    if (storedSession && !exchangeId && storedSession.exchangeId) {
-      exchangeId = storedSession.exchangeId;
-    }
     
     // 转换请求格式（完整传递，支持工具调用）
     const { upstreamRequest, toolMode, hasToolResults } = convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession);

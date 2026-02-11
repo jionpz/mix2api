@@ -141,7 +141,7 @@ paths:
             x-session-id:
               schema:
                 type: string
-              description: Optional upstream session id propagated by adapter.
+              description: Session id returned by upstream. The first reusable value is established during bootstrap.
           content:
             application/json:
               schema:
@@ -393,6 +393,16 @@ components:
           minItems: 1
           items:
             $ref: "#/components/schemas/ChatMessage"
+        session_id:
+          type: string
+          description: |
+            Optional session id for established conversations.
+            For bootstrap requests (no stored mapping), adapter ignores client-provided session_id and lets upstream create one.
+        exchange_id:
+          type: string
+          description: |
+            Optional exchange id for established conversations.
+            For bootstrap requests (no stored mapping), adapter ignores client-provided exchange_id.
         tools:
           type: array
           items:
@@ -458,6 +468,7 @@ components:
         session_id:
           type: string
           nullable: true
+          description: Session id returned by upstream and exposed by adapter for follow-up turns.
         object:
           type: string
           enum: [chat.completion]
