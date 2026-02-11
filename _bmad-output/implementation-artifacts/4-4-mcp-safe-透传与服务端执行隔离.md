@@ -1,6 +1,6 @@
 # Story 4.4: MCP-safe 透传与服务端执行隔离
 
-Status: review
+Status: done
 
 ## Story
 
@@ -81,3 +81,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 4.4（MCP-safe 透传与服务端执行隔离）：加强非 function tools 的防守性处理与回归覆盖。
+- 2026-02-11: 完成 Story 4.4 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 当前策略对 `type!="function"` 的 tools 采取“忽略 + 不允许落 tool_calls”最安全；如未来引入服务端 MCP Gateway，请单独立项并隔离执行面（鉴权/审计/沙箱）。
+
+### Verification
+
+- `node --test` 通过（38 passed, 2 skipped）
