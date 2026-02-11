@@ -109,6 +109,12 @@ node --test --test-name-pattern "legacy functions|tool_calls|tool backfill|MCP-s
 node --test --test-name-pattern "timeout|client abort|upstream HTTP error" tests/integration/chat-completions-auth-nonstream.test.js
 ```
 
+一键门禁（会生成 `summary.txt` 与分包日志）：
+
+```bash
+npm run release:gate -- stable v2026.02.11
+```
+
 全量回归：
 
 ```bash
@@ -133,3 +139,4 @@ OpenAPI 3.0 文档位于：
 - `docs/architecture.md`
 - `docs/session.md`
 - `docs/tools-mcp-skills.md`
+- `docs/release-gate.md`

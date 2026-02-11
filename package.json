@@ -6,7 +6,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:pack:a": "node --test --test-name-pattern \"stream=true|DONE|flushes first chunk|request.completed logs fixed dimensions\" tests/integration/chat-completions-auth-nonstream.test.js",
+    "test:pack:b": "node --test --test-name-pattern \"forwards tools schema|legacy functions|tool_calls|tool backfill|MCP-safe\" tests/integration/chat-completions-auth-nonstream.test.js",
+    "test:pack:c": "node --test --test-name-pattern \"timeout|client abort|upstream HTTP error|upstream payload error\" tests/integration/chat-completions-auth-nonstream.test.js",
+    "release:gate": "bash scripts/release-gate.sh"
   },
   "dependencies": {
     "express": "^4.22.1",
