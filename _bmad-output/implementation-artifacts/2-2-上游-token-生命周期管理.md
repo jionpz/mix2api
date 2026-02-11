@@ -1,6 +1,6 @@
 # Story 2.2: 上游 token 生命周期管理
 
-Status: review
+Status: done
 
 ## Story
 
@@ -100,3 +100,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 2.2（上游 token 生命周期管理）：新增 managed 鉴权模式、token 失效恢复重试与日志脱敏，并补齐集成回归测试。
+- 2026-02-11: 完成 Story 2.2 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 建议后续补充“并发请求同时触发 token 刷新仅发起一次上游 token 请求”的回归测试，进一步验证并发稳定性。
+
+### Verification
+
+- `npm test` 通过（23/23）
