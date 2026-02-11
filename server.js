@@ -85,9 +85,26 @@ function envJson(name, fallback) {
 }
 
 function redactHeaders(headers) {
-  const out = { ...headers };
-  if (out.authorization) out.authorization = 'Bearer ***';
-  if (out['proxy-authorization']) out['proxy-authorization'] = '***';
+  const src = (headers && typeof headers === 'object') ? headers : {};
+  const out = { ...src };
+  const redactValue = (key, value) => {
+    const k = String(key || '').toLowerCase();
+    const isAuth = k.includes('authorization');
+    const isCookie = k.includes('cookie');
+    const isToken = k.includes('token') || k.includes('api-key') || k.includes('apikey') || k.includes('x-api-key');
+    const isSession = k.includes('session') || k.includes('exchange');
+    if (isAuth) return 'Bearer ***';
+    if (isCookie || isToken || isSession) return '***';
+    return value;
+  };
+  for (const key of Object.keys(out)) {
+    const val = out[key];
+    if (Array.isArray(val)) {
+      out[key] = val.map((v) => redactValue(key, v));
+    } else {
+      out[key] = redactValue(key, val);
+    }
+  }
   return out;
 }
 
@@ -96,6 +113,7 @@ function redactSensitiveText(text) {
   let output = String(text);
   output = output.replace(/\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b/gi, 'Bearer ***');
   output = output.replace(/("?(access_?token|refresh_?token|id_?token|token)"?\s*[:=]\s*")([^"]*)"/gi, '$1***"');
+  output = output.replace(/("?(sessionId|session_id|exchangeId|exchange_id)"?\s*[:=]\s*")([^"]*)"/gi, '$1***"');
   output = output.replace(/\b(token=)[^&\s]+/gi, '$1***');
   return output;
 }
@@ -398,7 +416,7 @@ async function updateStoredSession(key, sessionId, exchangeId) {
     }
   }
 
-  console.log(`📌 Session stored: key=${key}, sessionId=${sessionId}, exchangeId=${nextExchangeId || 'null'}, turnCount=${turnCount}`);
+  console.log(`📌 Session stored: key=${key}, session_fp=${fingerprint(sessionId)}, exchange_fp=${nextExchangeId ? fingerprint(nextExchangeId) : 'none'}, turnCount=${turnCount}`);
 }
 
 async function clearStoredSession(key) {
@@ -1311,7 +1329,7 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   const conversationText = shouldIncludeContext ? formatConversationForQuery(openaiRequest.messages) : '';
 
   if (hasSession) {
-    console.log(`ℹ Using session_id=${sessionId}, context managed by backend`);
+    console.log(`ℹ Using session_id_fp=${fingerprint(sessionId)}, context managed by backend`);
   } else if (conversationText) {
     console.log(`ℹ New session, including ${conversationText.length} chars context in query`);
   }
@@ -2124,7 +2142,7 @@ async function handleChatCompletion(req, res) {
         if (!exchangeId && stored.exchangeId) {
           exchangeId = stored.exchangeId;
         }
-        console.log(`ℹ Auto-session from store: sessionId=${sessionId} (key=${storeKey})`);
+        console.log(`ℹ Auto-session from store: session_fp=${fingerprint(sessionId)} (key=${storeKey})`);
       }
     }
 
@@ -2349,9 +2367,12 @@ async function handleChatCompletion(req, res) {
 
             // 从 START 帧捕获 session IDs（用于后续请求的 sessionId）
             if (!capturedSessionId) {
-              console.log(`[${requestId}] 🔍 Checking upstream data for session:`, JSON.stringify(upstreamData, null, 2));
               const ids = extractIdsFromUpstream(upstreamData);
-              console.log(`[${requestId}] 📋 Extracted IDs:`, ids);
+              if (logBodies) {
+                const exchangeFp = ids && ids.exchangeId ? fingerprint(ids.exchangeId) : 'none';
+                const sessionFp = ids && ids.sessionId ? fingerprint(ids.sessionId) : 'none';
+                console.log(`[${requestId}] 📋 Extracted IDs: exchange_fp=${exchangeFp} session_fp=${sessionFp}`);
+              }
               if (ids && (ids.sessionId || ids.exchangeId)) {
                 capturedSessionId = ids.sessionId || ids.exchangeId;
                 // 存入 session store，供后续请求自动使用
@@ -2416,7 +2437,10 @@ async function handleChatCompletion(req, res) {
         upstreamExchangeId = result.exchangeId || null;
       } else {
         const data = await response.json();
-        console.log(`[${requestId}] 🔍 Upstream non-stream response:`, JSON.stringify(data, null, 2));
+        if (logBodies) {
+          const safeJson = redactSensitiveText(JSON.stringify(data, null, 2));
+          console.log(`[${requestId}] 🔍 Upstream non-stream response:`, safeJson);
+        }
         const upstreamError = extractErrorFromUpstreamResponse(data);
         if (upstreamError) {
           const safeUpstreamError = redactSensitiveText(upstreamError);
@@ -2432,7 +2456,11 @@ async function handleChatCompletion(req, res) {
         // 非 SSE 响应也尝试提取 session IDs
         if (data) {
           const ids = extractIdsFromUpstream(data);
-          console.log(`[${requestId}] 📋 Extracted IDs from non-stream:`, ids);
+          if (logBodies) {
+            const exchangeFp = ids && ids.exchangeId ? fingerprint(ids.exchangeId) : 'none';
+            const sessionFp = ids && ids.sessionId ? fingerprint(ids.sessionId) : 'none';
+            console.log(`[${requestId}] 📋 Extracted IDs from non-stream: exchange_fp=${exchangeFp} session_fp=${sessionFp}`);
+          }
           if (ids && (ids.sessionId || ids.exchangeId)) {
             upstreamSessionId = ids.sessionId || ids.exchangeId;
             upstreamExchangeId = ids.exchangeId || upstreamExchangeId;

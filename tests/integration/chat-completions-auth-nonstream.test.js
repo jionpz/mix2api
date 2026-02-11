@@ -1390,6 +1390,50 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for upst
   assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
 });
 
+test('POST /v1/chat/completions redacts sensitive headers in logs when LOG_HEADERS=true', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: { LOG_HEADERS: 'true' },
+    collectLogs: true
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      cookie: 'session=abc; token=def',
+      'x-session-id': 'sess-plain',
+      'user-agent': 'OpenCode/1.0'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'check header redaction' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.ok(!logs.includes('inbound-test-token'));
+  assert.ok(!logs.includes('session=abc'));
+  assert.ok(!logs.includes('token=def'));
+  assert.ok(!logs.includes('sess-plain'));
+  assert.match(logs, /"authorization"\s*:\s*"Bearer \*\*\*"/);
+  assert.match(logs, /"cookie"\s*:\s*"\*\*\*"/);
+  assert.match(logs, /"x-session-id"\s*:\s*"\*\*\*"/);
+});
+
 test('POST /v1/chat/completions forwards tools schema fields without losing key parameters', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();
