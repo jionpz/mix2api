@@ -12,10 +12,23 @@ const { createClient } = require('redis');
 const app = express();
 app.disable('x-powered-by');
 
+function normalizeRequestId(value) {
+  if (value === undefined || value === null) return null;
+  const id = String(value).trim();
+  if (!id) return null;
+  if (id.length > 128) return null;
+  if (!/^[A-Za-z0-9._:-]+$/.test(id)) return null;
+  return id;
+}
+
 app.use((req, res, next) => {
-  if (!res.getHeader('x-request-id')) {
-    res.setHeader('x-request-id', uuidv4());
-  }
+  const headerValue = Array.isArray(req.headers['x-request-id'])
+    ? req.headers['x-request-id'][0]
+    : req.headers['x-request-id'];
+  const requestId = normalizeRequestId(headerValue) || uuidv4();
+  req.requestId = requestId;
+  res.locals.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
   next();
 });
 
@@ -116,10 +129,16 @@ function extractMessageText(content) {
 // 请求日志中间件
 app.use((req, res, next) => {
   const logHeaders = envBool('LOG_HEADERS', false);
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  const requestId = req.requestId || String(res.getHeader('x-request-id') || uuidv4());
+  const startedAt = Date.now();
+  console.log(`[${new Date().toISOString()}] [${requestId}] request.received method=${req.method} path=${req.url}`);
   if (logHeaders) {
-    console.log('Headers:', JSON.stringify(redactHeaders(req.headers), null, 2));
+    console.log(`[${new Date().toISOString()}] [${requestId}] headers=${JSON.stringify(redactHeaders(req.headers), null, 2)}`);
   }
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed status=${res.statusCode} duration_ms=${durationMs}`);
+  });
   next();
 });
 
@@ -1691,7 +1710,7 @@ async function handleChatCompletion(req, res) {
     const expectedInboundToken = process.env.INBOUND_BEARER_TOKEN || null;
     const staticUpstreamToken = process.env.UPSTREAM_BEARER_TOKEN || null;
 
-    const requestId = String(res.getHeader('x-request-id') || uuidv4());
+    const requestId = req.requestId || String(res.getHeader('x-request-id') || uuidv4());
     if (!res.getHeader('x-request-id')) res.setHeader('x-request-id', requestId);
     const streamId = `chatcmpl-${uuidv4()}`;
     

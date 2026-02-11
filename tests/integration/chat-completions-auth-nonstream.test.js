@@ -1030,6 +1030,78 @@ test('POST /v1/chat/completions with managed auth refreshes token and retries af
   assert.equal(logs.includes(freshToken), false);
 });
 
+test('POST /v1/chat/completions preserves inbound x-request-id and forwards it upstream', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort, collectLogs: true });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const inboundRequestId = 'req-client-12345';
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      'x-request-id': inboundRequestId
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'request id passthrough' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-request-id'), inboundRequestId);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].headers['x-request-id'], inboundRequestId);
+
+  await sleep(50);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /\[req-client-12345\] request\.received/);
+  assert.match(logs, /\[req-client-12345\] request\.completed/);
+});
+
+test('POST /v1/chat/completions regenerates invalid inbound x-request-id', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const invalidInboundRequestId = 'bad id with spaces';
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      'x-request-id': invalidInboundRequestId
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'invalid request id should be replaced' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const generatedRequestId = String(res.headers.get('x-request-id') || '');
+  assert.notEqual(generatedRequestId, invalidInboundRequestId);
+  assert.match(generatedRequestId, /^[A-Za-z0-9._:-]{1,128}$/);
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].headers['x-request-id'], generatedRequestId);
+});
+
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
   if (!HAS_REDIS_SERVER) {
     t.skip('redis-server not available in test environment');

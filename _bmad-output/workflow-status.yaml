@@ -34,6 +34,7 @@ outputs:
   story_2_2: '_bmad-output/implementation-artifacts/2-2-上游-token-生命周期管理.md'
   story_2_3: '_bmad-output/implementation-artifacts/2-3-自动会话创建与上游会话复用.md'
   story_2_4: '_bmad-output/implementation-artifacts/2-4-redis-共享状态与-schemaversion-降级机制.md'
+  story_3_1: '_bmad-output/implementation-artifacts/3-1-request-id-贯通与排障关联头.md'
 next_recommended:
   - code-review
   - sprint-status
@@ -67,3 +68,5 @@ notes:
   - 'Created Story 2.4 and moved it to ready-for-dev on 2026-02-11.'
   - 'Implemented Story 2.4 and moved it to review on 2026-02-11.'
   - 'Story 2.4 code-review completed and moved to done on 2026-02-11.'
+  - 'Created Story 3.1 and moved it to ready-for-dev on 2026-02-11.'
+  - 'Implemented Story 3.1 and moved it to review on 2026-02-11.'
