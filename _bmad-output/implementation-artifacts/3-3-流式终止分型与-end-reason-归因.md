@@ -1,6 +1,6 @@
 # Story 3.3: 流式终止分型与 end_reason 归因
 
-Status: review
+Status: done
 
 ## Story
 
@@ -92,3 +92,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 3.3（流式终止分型与 end_reason 归因）：统一 end_reason 分型并补齐流式终止归因回归测试。
+- 2026-02-11: 完成 Story 3.3 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 建议后续在指标系统落地 `end_reason` 枚举白名单校验，避免未来新增分型时造成口径漂移。
+
+### Verification
+
+- `npm test` 通过（29 passed, 2 skipped）
