@@ -1,11 +1,15 @@
 {
   "recommendations": [
+    "EditorConfig.EditorConfig",
     "dbaeumer.vscode-eslint",
+    "eamodio.gitlens",
     "esbenp.prettier-vscode",
+    "humao.rest-client",
+    "mikestead.dotenv",
     "ms-azuretools.vscode-docker",
     "redhat.vscode-yaml",
-    "mikestead.dotenv",
-    "eamodio.gitlens",
+    "streetsidesoftware.code-spell-checker",
+    "yzhang.markdown-all-in-one",
     "usernamehw.errorlens"
   ]
 }

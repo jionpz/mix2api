@@ -1,17 +1,4 @@
 services:
-  new-api:
-    image: calciumion/new-api:latest
-    container_name: new-api
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      TZ: Asia/Shanghai
-    volumes:
-      - ./new-api-data:/data
-    networks:
-      - mix2api-net
-
   mix2api:
     build:
       context: .
@@ -23,10 +10,3 @@ services:
       TZ: Asia/Shanghai
     ports:
       - "3001:3001"
-    networks:
-      - mix2api-net
-
-networks:
-  mix2api-net:
-    driver: bridge
-

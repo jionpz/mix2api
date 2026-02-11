@@ -1,0 +1,82 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "mix2api: start",
+      "type": "shell",
+      "command": "npm run start",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: test all",
+      "type": "shell",
+      "command": "npm test",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: test pack A",
+      "type": "shell",
+      "command": "npm run test:pack:a",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: test pack B",
+      "type": "shell",
+      "command": "npm run test:pack:b",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: test pack C",
+      "type": "shell",
+      "command": "npm run test:pack:c",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: release gate (prompt)",
+      "type": "shell",
+      "command": "npm run release:gate -- ${input:releaseChannel} ${input:releaseVersion}",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: compose up mix2api",
+      "type": "shell",
+      "command": "docker compose up -d --build mix2api",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "mix2api: compose down",
+      "type": "shell",
+      "command": "docker compose down",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "releaseChannel",
+      "type": "pickString",
+      "description": "Choose release channel",
+      "options": [
+        "stable",
+        "canary"
+      ],
+      "default": "stable"
+    },
+    {
+      "id": "releaseVersion",
+      "type": "promptString",
+      "description": "Input release version tag",
+      "default": "vlocal"
+    }
+  ]
+}

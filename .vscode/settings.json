@@ -1,0 +1,39 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": true
+  },
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/_bmad-output/release-gates": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/_bmad-output/release-gates/**": true
+  },
+  "eslint.validate": [
+    "javascript",
+    "javascriptreact",
+    "typescript",
+    "typescriptreact"
+  ],
+  "yaml.validate": true,
+  "yaml.schemas": {
+    "https://raw.githubusercontent.com/OAI/OpenAPI-Specification/main/schemas/v3.0/schema.json": "docs/openapi.yaml"
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on"
+  },
+  "cSpell.words": [
+    "canary",
+    "end_reason",
+    "mix2api",
+    "newapi",
+    "opencode",
+    "tool_call_id"
+  ]
+}
