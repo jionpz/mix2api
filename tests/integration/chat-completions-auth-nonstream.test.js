@@ -1707,6 +1707,140 @@ test('POST /v1/chat/completions returns unique tool_call ids for multiple tool c
   assert.notEqual(json.choices[0].message.tool_calls[0].id, json.choices[0].message.tool_calls[1].id);
 });
 
+test('POST /v1/chat/completions parses loose tool_call protocol text from upstream', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: '让我检查一下这个文件是否存在： {tool_call: (name: read, arguments: (filePath:/home/jionzhang/mycode/baslerCamera/_bmad/core/tasks/help.md}}'
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read',
+            parameters: {
+              type: 'object',
+              properties: { filePath: { type: 'string' } },
+              required: ['filePath']
+            }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: '检查这个文件是否存在' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].finish_reason, 'tool_calls');
+  assert.equal(json.choices[0].message.content, null);
+  assert.equal(Array.isArray(json.choices[0].message.tool_calls), true);
+  assert.equal(json.choices[0].message.tool_calls.length, 1);
+  assert.equal(json.choices[0].message.tool_calls[0].function.name, 'read');
+  const args = JSON.parse(json.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(args.filePath, '/home/jionzhang/mycode/baslerCamera/_bmad/core/tasks/help.md');
+});
+
+test('POST /v1/chat/completions parses loose tool_call without arguments as empty object', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: '{tool_call: (name: read)}'
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read',
+          parameters: { type: 'object', properties: { filePath: { type: 'string' } } }
+        }
+      }],
+      messages: [{ role: 'user', content: '读取文件' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].finish_reason, 'tool_calls');
+  assert.equal(Array.isArray(json.choices[0].message.tool_calls), true);
+  assert.equal(json.choices[0].message.tool_calls.length, 1);
+  assert.equal(json.choices[0].message.tool_calls[0].function.name, 'read');
+  assert.deepEqual(JSON.parse(json.choices[0].message.tool_calls[0].function.arguments), {});
+});
+
+test('POST /v1/chat/completions does not leak malformed tool_call text when name is missing', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort, {
+    nonStreamContent: '让我检查一下： {tool_call: (arguments: (filePath:/tmp/secret.txt}}'
+  });
+  const adapterProc = await startAdapter({ port: adapterPort, upstreamPort });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read',
+          parameters: { type: 'object', properties: { filePath: { type: 'string' } } }
+        }
+      }],
+      messages: [{ role: 'user', content: '检查文件' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].finish_reason, 'stop');
+  assert.equal(typeof json.choices[0].message.content, 'string');
+  assert.equal(json.choices[0].message.content, '抱歉，工具调用响应格式异常，请重试。');
+  assert.doesNotMatch(json.choices[0].message.content, /tool_call/i);
+  assert.doesNotMatch(json.choices[0].message.content, /\/tmp\/secret\.txt/i);
+});
+
 test('POST /v1/chat/completions stream tool_calls keep unique ids when upstream ids conflict', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();
