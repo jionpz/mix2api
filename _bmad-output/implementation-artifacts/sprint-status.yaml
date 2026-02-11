@@ -62,7 +62,7 @@ development_status:
   epic-3-retrospective: optional
 
   epic-4: backlog
-  4-1-tools-与-legacy-functions-入参兼容: backlog
+  4-1-tools-与-legacy-functions-入参兼容: review
   4-2-tool-calls-输出与-tool-call-id-一致性: backlog
   4-3-tool-结果回填与继续生成闭环: backlog
   4-4-mcp-safe-透传与服务端执行隔离: backlog

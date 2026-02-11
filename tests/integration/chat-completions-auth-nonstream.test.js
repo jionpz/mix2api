@@ -1383,6 +1383,126 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for upst
   assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
 });
 
+test('POST /v1/chat/completions forwards tools schema fields without losing key parameters', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      SEND_UPSTREAM_TOOLS: 'true',
+      TOOL_KEEP_ALL: 'true'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read local file content',
+          strict: true,
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string' },
+              encoding: { type: 'string', enum: ['utf8', 'base64'] }
+            },
+            required: ['path']
+          }
+        }
+      }],
+      messages: [{ role: 'user', content: 'read README file' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.stream, false);
+  assert.equal(Array.isArray(requests[0].body.tools), true);
+  assert.equal(requests[0].body.tools.length, 1);
+  assert.equal(requests[0].body.tools[0].type, 'function');
+  assert.equal(requests[0].body.tools[0].function.name, 'read_file');
+  assert.equal(requests[0].body.tools[0].function.description, 'Read local file content');
+  assert.equal(requests[0].body.tools[0].function.strict, true);
+  assert.equal(requests[0].body.tools[0].function.parameters.properties.path.type, 'string');
+  assert.deepEqual(requests[0].body.tools[0].function.parameters.required, ['path']);
+});
+
+test('POST /v1/chat/completions maps legacy functions/function_call to tools compatible structure', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      SEND_UPSTREAM_TOOLS: 'true',
+      TOOL_KEEP_ALL: 'true'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      functions: [{
+        name: 'get_weather',
+        description: 'Get weather by city',
+        parameters: {
+          type: 'object',
+          properties: {
+            city: { type: 'string' }
+          },
+          required: ['city']
+        }
+      }],
+      function_call: { name: 'get_weather' },
+      messages: [{ role: 'user', content: 'weather in Shanghai' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.stream, false);
+  assert.equal(Array.isArray(requests[0].body.tools), true);
+  assert.equal(requests[0].body.tools.length, 1);
+  assert.equal(requests[0].body.tools[0].type, 'function');
+  assert.equal(requests[0].body.tools[0].function.name, 'get_weather');
+  assert.equal(requests[0].body.tools[0].function.description, 'Get weather by city');
+  assert.equal(requests[0].body.tools[0].function.parameters.properties.city.type, 'string');
+  assert.deepEqual(requests[0].body.tools[0].function.parameters.required, ['city']);
+  assert.deepEqual(requests[0].body.tool_choice, {
+    type: 'function',
+    function: { name: 'get_weather' }
+  });
+});
+
 test('POST /v1/chat/completions reuses session mapping across adapters when sharing redis', async (t) => {
   if (!HAS_REDIS_SERVER) {
     t.skip('redis-server not available in test environment');

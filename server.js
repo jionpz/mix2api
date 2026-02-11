@@ -1101,6 +1101,90 @@ function formatConversationForQuery(messages) {
   return out;
 }
 
+function normalizeLegacyFunctionsToTools(functions) {
+  if (!Array.isArray(functions) || functions.length === 0) return [];
+  return functions
+    .filter((fn) => fn && typeof fn === 'object')
+    .map((fn) => {
+      const name = typeof fn.name === 'string' ? fn.name.trim() : '';
+      if (!name) return null;
+      return {
+        type: 'function',
+        function: {
+          ...fn,
+          name
+        }
+      };
+    })
+    .filter(Boolean);
+}
+
+function normalizeLegacyFunctionCallToToolChoice(functionCall) {
+  if (functionCall == null) return undefined;
+  if (typeof functionCall === 'string') {
+    const mode = functionCall.trim().toLowerCase();
+    if (mode === 'auto' || mode === 'none' || mode === 'required') return mode;
+    return undefined;
+  }
+  if (typeof functionCall === 'object') {
+    const name = typeof functionCall.name === 'string' ? functionCall.name.trim() : '';
+    if (!name) return undefined;
+    return {
+      type: 'function',
+      function: { name }
+    };
+  }
+  return undefined;
+}
+
+function normalizeOpenAIRequestTooling(input) {
+  if (!input || typeof input !== 'object') return input;
+  const normalized = { ...input };
+
+  let normalizedTools = [];
+  if (Array.isArray(input.tools) && input.tools.length > 0) {
+    normalizedTools = input.tools
+      .filter((tool) => tool && typeof tool === 'object')
+      .map((tool) => {
+        if (tool.type === 'function' && tool.function && typeof tool.function === 'object') {
+          const fnName = typeof tool.function.name === 'string' ? tool.function.name.trim() : tool.function.name;
+          return {
+            ...tool,
+            function: {
+              ...tool.function,
+              ...(typeof fnName === 'string' ? { name: fnName } : {})
+            }
+          };
+        }
+        if (typeof tool.name === 'string' && tool.name.trim()) {
+          return {
+            type: 'function',
+            function: {
+              ...tool,
+              name: tool.name.trim()
+            }
+          };
+        }
+        return { ...tool };
+      });
+  } else if (Array.isArray(input.functions) && input.functions.length > 0) {
+    normalizedTools = normalizeLegacyFunctionsToTools(input.functions);
+  }
+
+  if (normalizedTools.length > 0) {
+    normalized.tools = normalizedTools;
+  }
+
+  if (normalized.tool_choice == null) {
+    const mappedToolChoice = normalizeLegacyFunctionCallToToolChoice(input.function_call);
+    if (mappedToolChoice !== undefined) {
+      normalized.tool_choice = mappedToolChoice;
+    }
+  }
+
+  return normalized;
+}
+
 // OpenAI 格式转上游格式 (完整传递，支持工具调用)
 function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession) {
   const lastMessage = openaiRequest.messages[openaiRequest.messages.length - 1];
@@ -1726,7 +1810,7 @@ async function handleChatCompletion(req, res) {
   const requestId = req.requestId || String(res.getHeader('x-request-id') || uuidv4());
   if (!res.getHeader('x-request-id')) res.setHeader('x-request-id', requestId);
   try {
-    const openaiRequest = req.body;
+    const requestBody = req.body;
     const authHeader = req.headers['authorization'];
     const inboundAuthMode = String(process.env.INBOUND_AUTH_MODE || 'bearer').toLowerCase(); // bearer | none
     const upstreamAuthMode = String(process.env.UPSTREAM_AUTH_MODE || 'pass_through').toLowerCase(); // pass_through | static | managed | none
@@ -1772,7 +1856,7 @@ async function handleChatCompletion(req, res) {
     }
 
     // 基本请求校验（避免后续 NPE）
-    if (!openaiRequest || typeof openaiRequest !== 'object') {
+    if (!requestBody || typeof requestBody !== 'object') {
       setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request body',
@@ -1781,7 +1865,7 @@ async function handleChatCompletion(req, res) {
         param: null
       });
     }
-    if (typeof openaiRequest.model !== 'string' || !openaiRequest.model.trim()) {
+    if (typeof requestBody.model !== 'string' || !requestBody.model.trim()) {
       setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request: model must be a non-empty string',
@@ -1790,7 +1874,7 @@ async function handleChatCompletion(req, res) {
         param: 'model'
       });
     }
-    if (!Array.isArray(openaiRequest.messages) || openaiRequest.messages.length === 0) {
+    if (!Array.isArray(requestBody.messages) || requestBody.messages.length === 0) {
       setRequestEndReason(res, 'invalid_request');
       return sendOpenAIError(res, 400, {
         message: 'Invalid request: messages must be a non-empty array',
@@ -1800,12 +1884,11 @@ async function handleChatCompletion(req, res) {
       });
     }
 
+    const openaiRequest = normalizeOpenAIRequestTooling(requestBody);
+
     const requestClient = inferClientId(req);
     const clientWantsStream = openaiRequest.stream !== false;
-    const toolsPresent = (
-      (Array.isArray(openaiRequest.tools) && openaiRequest.tools.length > 0)
-      || (Array.isArray(openaiRequest.functions) && openaiRequest.functions.length > 0)
-    );
+    const toolsPresent = Array.isArray(openaiRequest.tools) && openaiRequest.tools.length > 0;
     res.locals.client = requestClient;
     res.locals.stream = String(clientWantsStream);
     res.locals.toolsPresent = String(toolsPresent);
