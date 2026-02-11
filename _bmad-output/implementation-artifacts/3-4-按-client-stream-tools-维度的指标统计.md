@@ -1,6 +1,6 @@
 # Story 3.4: 按 client×stream×tools 维度的指标统计
 
-Status: review
+Status: done
 
 ## Story
 
@@ -90,3 +90,22 @@ GPT-5 (Codex)
 ### Change Log
 
 - 2026-02-11: 实现 Story 3.4（按 client×stream×tools 维度的指标统计）：固定请求完成日志维度并补齐回归测试。
+- 2026-02-11: 完成 Story 3.4 代码审查并通过，状态由 review 更新为 done。
+
+## Senior Developer Review (AI)
+
+### Review Date
+
+2026-02-11
+
+### Outcome
+
+Approved (no blocking findings)
+
+### Findings
+
+- [LOW] 建议后续在观测平台增加 `client/stream/tools_present` 的枚举约束看板，提前发现异常维度值。
+
+### Verification
+
+- `npm test` 通过（31 passed, 2 skipped）
