@@ -1841,6 +1841,64 @@ test('POST /v1/chat/completions does not leak malformed tool_call text when name
   assert.doesNotMatch(json.choices[0].message.content, /\/tmp\/secret\.txt/i);
 });
 
+test('POST /v1/chat/completions shrinks tool results in query before truncating whole query', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      QUERY_MAX_CHARS: '2000'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const hugeToolOutput = 'X'.repeat(50000);
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [
+        { role: 'user', content: '请基于工具输出做总结' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'read', arguments: '{}' }
+          }]
+        },
+        {
+          role: 'tool',
+          tool_call_id: 'call_1',
+          name: 'read',
+          content: hugeToolOutput
+        }
+      ]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.ok(requests.length >= 1);
+  const sentQuery = requests[0].body?.request?.query;
+  assert.equal(typeof sentQuery, 'string');
+  assert.ok(sentQuery.length <= 2000, `unexpected query length: ${sentQuery.length}`);
+  assert.match(sentQuery, /\[当前问题\]/);
+  assert.match(sentQuery, /请基于工具输出做总结/);
+  assert.doesNotMatch(sentQuery, /\[query已截断\]/);
+});
+
 test('POST /v1/chat/completions stream tool_calls keep unique ids when upstream ids conflict', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();

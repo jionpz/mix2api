@@ -869,6 +869,131 @@ function truncateTextKeepTail(text, maxChars, marker) {
   return `${m}\n${text.slice(text.length - keep)}`;
 }
 
+function truncateTextKeepHeadAndTail(text, maxChars, marker, headRatio = 0.6) {
+  if (typeof text !== 'string') return '';
+  if (!maxChars || maxChars <= 0) return text;
+  if (text.length <= maxChars) return text;
+
+  const m = marker || '[已截断]';
+  const ratio = (typeof headRatio === 'number' && headRatio > 0 && headRatio < 1) ? headRatio : 0.6;
+
+  // head + "\n" + marker + "\n" + tail
+  const budget = maxChars - m.length - 2;
+  if (budget <= 0) return m.slice(0, Math.max(0, maxChars));
+
+  const headBudget = Math.max(0, Math.floor(budget * ratio));
+  const tailBudget = Math.max(0, budget - headBudget);
+  const headText = text.slice(0, headBudget).trimEnd();
+  const tailText = tailBudget > 0 ? text.slice(text.length - tailBudget).trimStart() : '';
+  if (!tailText) {
+    return truncateTextKeepTail(text, maxChars, m);
+  }
+  return `${headText}\n${m}\n${tailText}`;
+}
+
+function buildSafeQueryForUpstream({
+  conversationText,
+  toolResultsText,
+  questionText,
+  toolInstruction,
+  injectIntoQuery,
+  injectIntoMessages,
+  queryMaxChars
+}) {
+  const toolInstructionText = (typeof toolInstruction === 'string') ? toolInstruction.trim() : '';
+  const originalConversation = (typeof conversationText === 'string') ? conversationText.trim() : '';
+  const originalToolResults = (typeof toolResultsText === 'string') ? toolResultsText.trim() : '';
+  const originalQuestion = (typeof questionText === 'string') ? questionText.trim() : '';
+
+  let conversation = originalConversation ? originalConversation : null;
+  let toolResults = originalToolResults ? originalToolResults : null;
+  let question = originalQuestion;
+  let includeToolInstructionInQuery = Boolean(injectIntoQuery && toolInstructionText);
+
+  const compose = ({
+    conversationOverride = conversation,
+    toolResultsOverride = toolResults,
+    questionOverride = question,
+    includeToolInstructionOverride = includeToolInstructionInQuery
+  } = {}) => {
+    const parts = [];
+    if (conversationOverride !== null && conversationOverride !== undefined) {
+      parts.push(`[对话历史]\n${conversationOverride}`);
+    }
+    if (toolResultsOverride !== null && toolResultsOverride !== undefined) {
+      parts.push(`[工具执行结果]\n${toolResultsOverride}`);
+    }
+    parts.push(`[当前问题]\n${questionOverride || ''}`);
+    if (toolResultsOverride !== null && toolResultsOverride !== undefined) {
+      parts.push('请基于以上工具输出给出最终回答。');
+    }
+    if (includeToolInstructionOverride) {
+      parts.push(toolInstructionText);
+    }
+    return parts.join('\n\n');
+  };
+
+  const maxChars = Number(queryMaxChars || 0);
+  if (!maxChars || maxChars <= 0) return compose();
+
+  let query = compose();
+  if (query.length <= maxChars) return query;
+
+  // 优先：如果 tool 指令已经注入 messages（TOOL_INSTRUCTION_MODE=both），则从 query 去掉重复指令以节省预算
+  if (includeToolInstructionInQuery && injectIntoMessages) {
+    includeToolInstructionInQuery = false;
+    query = compose({ includeToolInstructionOverride: false });
+    if (query.length <= maxChars) return query;
+  }
+
+  // 有工具结果时：对话历史优先级最低，超限则先移除（避免挤掉“当前问题/工具结果”）
+  if (toolResults && conversation) {
+    conversation = null;
+    query = compose();
+    if (query.length <= maxChars) return query;
+  }
+
+  // 依次压缩：工具结果 -> 对话历史 -> 当前问题
+  if (toolResults !== null && toolResults !== undefined) {
+    const base = compose({ toolResultsOverride: '' });
+    const available = maxChars - base.length;
+    if (available <= 0) {
+      toolResults = null;
+    } else {
+      toolResults = truncateTextKeepHeadAndTail(toolResults, available, '[工具执行结果已截断]');
+    }
+    query = compose();
+    if (query.length <= maxChars) return query;
+  }
+
+  if (conversation !== null && conversation !== undefined) {
+    const base = compose({ conversationOverride: '' });
+    const available = maxChars - base.length;
+    if (available <= 0) {
+      conversation = null;
+    } else {
+      conversation = truncateTextKeepHeadAndTail(conversation, available, '[对话历史已截断]');
+    }
+    query = compose();
+    if (query.length <= maxChars) return query;
+  }
+
+  {
+    const base = compose({ questionOverride: '' });
+    const available = maxChars - base.length;
+    if (available <= 0) {
+      question = '';
+    } else {
+      question = truncateTextKeepHeadAndTail(question, available, '[当前问题已截断]', 0.75);
+    }
+    query = compose();
+    if (query.length <= maxChars) return query;
+  }
+
+  // 最后兜底：整体截断（理论上不应触发，但避免极端输入导致上游 4xx）
+  return truncateTextKeepTail(query, maxChars, '[query已截断]');
+}
+
 function trimMessagesForUpstream(messages) {
   // 限制发送给上游的 messages 数量与单条长度，避免触发 token 上限。
   if (!Array.isArray(messages) || messages.length === 0) return messages;
@@ -1152,7 +1277,7 @@ function formatToolResultsForPrompt(toolMessages) {
     const toolCallId = m.tool_call_id || '';
     let content = extractMessageText(m.content);
     if (maxChars > 0 && content.length > maxChars) {
-      content = `${content.slice(0, maxChars)}\n[工具输出已截断]`;
+      content = truncateTextKeepHeadAndTail(content, maxChars, '[工具输出已截断]');
     }
     const header = toolCallId ? `- 工具 ${name}（tool_call_id=${toolCallId}）输出：` : `- 工具 ${name} 输出：`;
     lines.push(header);
@@ -1258,7 +1383,7 @@ function formatConversationForQuery(messages) {
       if (t) {
         const perToolMax = envInt('TOOL_RESULT_MAX_CHARS', 20_000);
         if (perToolMax > 0 && t.length > perToolMax) {
-          t = `${t.slice(0, perToolMax)}\n[工具输出已截断]`;
+          t = truncateTextKeepHeadAndTail(t, perToolMax, '[工具输出已截断]');
         }
         lines.push(`Tool(${name}): ${t}`);
       }
@@ -1434,24 +1559,24 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
     console.log(`ℹ New session, including ${conversationText.length} chars context in query`);
   }
 
-  let baseQuery = baseUserText;
-  if (conversationText) {
-    baseQuery = `[对话历史]\n${conversationText}\n\n[当前问题]\n${baseQuery}`;
-  }
-  if (toolResultsText) {
-    baseQuery = `${baseQuery}\n\n[工具执行结果]\n${toolResultsText}\n\n请基于以上工具输出给出最终回答。`;
-  }
-
   const toolInstructionMode = (process.env.TOOL_INSTRUCTION_MODE || 'both').toLowerCase();
   const injectIntoQuery = toolMode && (toolInstructionMode === 'query' || toolInstructionMode === 'both');
   const injectIntoMessages = toolMode && (toolInstructionMode === 'messages' || toolInstructionMode === 'both');
-  const query = injectIntoQuery ? `${baseQuery}\n\n${toolInstruction}` : baseQuery;
-
-  // query 再做一道总长度保护（很多上游对“输入文本”有硬上限，如 4096 tokens）
+  // query 做总长度保护：优先分段裁剪（工具结果/对话历史/工具协议），避免整体截断导致“当前问题”丢失
   const queryMaxChars = envInt('QUERY_MAX_CHARS', 30_000);
-  const safeQuery = truncateTextKeepTail(query, queryMaxChars, '[query已截断]');
-  if (query !== safeQuery) {
-    console.warn(`⚠ Query truncated: ${query.length} -> ${safeQuery.length} chars (QUERY_MAX_CHARS=${queryMaxChars})`);
+  const safeQuery = buildSafeQueryForUpstream({
+    conversationText,
+    toolResultsText,
+    questionText: baseUserText,
+    toolInstruction,
+    injectIntoQuery,
+    injectIntoMessages,
+    queryMaxChars
+  });
+  if (envBool('LOG_TOOL_PARSE', false)) {
+    if (typeof safeQuery === 'string' && safeQuery.length > queryMaxChars) {
+      console.warn(`⚠ SafeQuery still exceeds QUERY_MAX_CHARS: ${safeQuery.length} > ${queryMaxChars}`);
+    }
   }
   
   // 从 model 参数提取实际的模型名称
