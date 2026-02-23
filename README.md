@@ -77,6 +77,7 @@ curl -sS http://127.0.0.1:3001/v1/models
 
 - `MODEL_PROFILE_JSON`：按模型配置 `context_window`、`max_input_tokens`、`max_new_tokens`
 - 未配置模型会回退到默认画像并记录告警日志（`model.profile.fallback`）
+- 建议将 `max_input_tokens` 控制在 `context_window` 的 `70%~85%`，避免贴上限导致边界超限
 - 输入预算估算会同时考虑 `messages` 与 `tools` 负载
 - 预留输出预算后可用输入预算计算：`available_input_tokens = min(max_input_tokens, context_window - reserved_output_tokens)`
 - 请求输入估算超出模型 `max_input_tokens` 时，返回 `400`（`context_length_exceeded`）
@@ -88,6 +89,7 @@ curl -sS http://127.0.0.1:3001/v1/models
 - 可选开启历史摘要记忆块（注入 query 的 `[历史摘要记忆]` 段）以在强裁剪下保留早期语义
 - 统一预算观测日志 `model.profile.budget_observation` 包含：`model`、`input_budget`、`output_budget`、`truncation_applied`、`reject_reason`
 - `request.completed` 也会携带同组预算字段，可按 `model` 聚合并结合 `x-request-id` 追踪失败样本
+- 简化配置建议：保持 `INCLUDE_CONTEXT_IN_QUERY=false`，通常无需配置 `CONTEXT_*` / `QUERY_MAX_CHARS` / `TOOL_RESULT_MAX_CHARS`
 - 默认画像由以下参数控制：
   - `MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW`
   - `MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS`
@@ -103,7 +105,10 @@ curl -sS http://127.0.0.1:3001/v1/models
 示例：
 
 ```bash
-MODEL_PROFILE_JSON='{"mix/qwen-3-235b-instruct":{"context_window":200000,"max_input_tokens":160000,"max_new_tokens":8192}}'
+MODEL_PROFILE_JSON='{"mix/qwen-3-235b-instruct":{"context_window":200000,"max_input_tokens":150000,"max_new_tokens":8192},"claude-sonnet-4-5":{"context_window":200000,"max_input_tokens":120000,"max_new_tokens":8192}}'
+MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS=120000
+TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS=1024
+INCLUDE_CONTEXT_IN_QUERY=false
 ```
 
 ## 4. 灰度与回滚建议
