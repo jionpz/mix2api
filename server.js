@@ -33,6 +33,11 @@ app.use((req, res, next) => {
   res.locals.client = 'unknown';
   res.locals.stream = 'unknown';
   res.locals.toolsPresent = 'unknown';
+  res.locals.model = 'unknown';
+  res.locals.inputBudget = 'none';
+  res.locals.outputBudget = 'none';
+  res.locals.truncationApplied = 'false';
+  res.locals.rejectReason = 'none';
   res.setHeader('x-request-id', requestId);
   next();
 });
@@ -176,7 +181,18 @@ app.use((req, res, next) => {
     const client = res.locals && res.locals.client != null ? res.locals.client : 'unknown';
     const stream = res.locals && res.locals.stream != null ? res.locals.stream : 'unknown';
     const toolsPresent = res.locals && res.locals.toolsPresent != null ? res.locals.toolsPresent : 'unknown';
-    console.log(`[${new Date().toISOString()}] [${requestId}] request.completed http_status=${res.statusCode} duration_ms=${durationMs} client=${client} stream=${stream} tools_present=${toolsPresent} end_reason=${endReason} upstream_status=${upstreamStatus}`);
+    const model = res.locals && res.locals.model != null ? res.locals.model : 'unknown';
+    const inputBudget = res.locals && res.locals.inputBudget != null ? res.locals.inputBudget : 'none';
+    const outputBudget = res.locals && res.locals.outputBudget != null ? res.locals.outputBudget : 'none';
+    const truncationApplied = res.locals && res.locals.truncationApplied != null ? res.locals.truncationApplied : 'false';
+    const rejectReason = res.locals && res.locals.rejectReason != null ? res.locals.rejectReason : 'none';
+    console.log(
+      `[${new Date().toISOString()}] [${requestId}] request.completed ` +
+      `http_status=${res.statusCode} duration_ms=${durationMs} client=${client} stream=${stream} tools_present=${toolsPresent} ` +
+      `model=${model} input_budget=${inputBudget} output_budget=${outputBudget} ` +
+      `truncation_applied=${truncationApplied} reject_reason=${rejectReason} ` +
+      `end_reason=${endReason} upstream_status=${upstreamStatus}`
+    );
     maybeRecordSampleTrace(req, res, { durationMs, startedAt });
   });
   next();
@@ -189,6 +205,12 @@ const UPSTREAM_REFERER = String(process.env.UPSTREAM_REFERER || '').trim();
 const UPSTREAM_ACCEPT_LANGUAGE = String(process.env.UPSTREAM_ACCEPT_LANGUAGE || 'zh-CN,zh;q=0.9,en;q=0.8').trim();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_MODEL_IDS = ['mix/qwen-3-235b-instruct', 'mix/claude-sonnet-4-5'];
+const MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW = Math.max(1, envInt('MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW', 200000));
+const MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS = Math.max(1, envInt('MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS', 160000));
+const MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS = Math.max(1, envInt('MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS', 8192));
+const MODEL_PROFILE_FALLBACK_WARN_CACHE_SIZE = Math.max(1, envInt('MODEL_PROFILE_FALLBACK_WARN_CACHE_SIZE', 1024));
+const TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS = Math.max(1, envInt('TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS', 1024));
+const MODEL_PROFILE_JSON = envJson('MODEL_PROFILE_JSON', {});
 const UPSTREAM_TOKEN_URL = String(process.env.UPSTREAM_TOKEN_URL || '').trim();
 const UPSTREAM_TOKEN_PATH = String(process.env.UPSTREAM_TOKEN_PATH || '/v2/token').trim();
 const UPSTREAM_TOKEN_METHOD = String(process.env.UPSTREAM_TOKEN_METHOD || 'POST').trim().toUpperCase();
@@ -222,6 +244,7 @@ let redisSessionInitPromise = null;
 let redisSessionDisabledReason = null;
 let redisSessionNextRetryAt = 0;
 const sampleTraceStore = new Map(); // traceId -> sampled trace meta
+const modelProfileFallbackWarned = new Set();
 let sampleTraceCleanupTimer = null;
 
 function shouldUseRedisSessionStore() {
@@ -809,6 +832,344 @@ function resolveModelIds() {
   return models.length > 0 ? models : DEFAULT_MODEL_IDS;
 }
 
+function toPositiveInt(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
+function estimateTokenByChars(chars) {
+  const safeChars = Math.max(0, Number(chars) || 0);
+  return Math.ceil(safeChars / 4);
+}
+
+function estimateInputPayloadChars(input) {
+  if (!input || typeof input !== 'object') return 0;
+  let totalChars = 0;
+  const messages = Array.isArray(input.messages) ? input.messages : [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    totalChars += extractMessageText(msg.content).length;
+    if (msg.name) totalChars += String(msg.name).length;
+    if (msg.tool_call_id) totalChars += String(msg.tool_call_id).length;
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      try {
+        totalChars += JSON.stringify(msg.tool_calls).length;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  if (Array.isArray(input.tools) && input.tools.length > 0) {
+    try {
+      totalChars += JSON.stringify(input.tools).length;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (input.tool_choice !== undefined) {
+    try {
+      totalChars += JSON.stringify(input.tool_choice).length;
+    } catch {
+      // ignore
+    }
+  }
+
+  return totalChars;
+}
+
+function estimateInputTokens(openaiRequest) {
+  const totalChars = estimateInputPayloadChars(openaiRequest);
+  return estimateTokenByChars(totalChars);
+}
+
+function estimateUpstreamInputTokens(upstreamRequest) {
+  if (!upstreamRequest || typeof upstreamRequest !== 'object') return 0;
+  const request = (upstreamRequest.request && typeof upstreamRequest.request === 'object')
+    ? upstreamRequest.request
+    : null;
+  const queryChars = (request && typeof request.query === 'string') ? request.query.length : 0;
+  const payloadChars = estimateInputPayloadChars(upstreamRequest);
+  return estimateTokenByChars(queryChars + payloadChars);
+}
+
+function buildDefaultModelProfile() {
+  const contextWindow = MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW;
+  const maxInputTokens = Math.min(MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS, contextWindow);
+  const maxNewTokens = Math.min(MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS, contextWindow);
+  return {
+    contextWindow,
+    maxInputTokens,
+    maxNewTokens
+  };
+}
+
+function normalizeModelProfileEntry(modelKey, rawProfile, defaultProfile) {
+  if (!rawProfile || typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
+    console.warn(`⚠ model.profile.invalid model=${modelKey} reason=invalid_profile_type`);
+    return null;
+  }
+
+  const contextRaw = rawProfile.context_window !== undefined ? rawProfile.context_window : rawProfile.contextWindow;
+  const maxInputRaw = rawProfile.max_input_tokens !== undefined ? rawProfile.max_input_tokens : rawProfile.maxInputTokens;
+  const maxNewRaw = rawProfile.max_new_tokens !== undefined ? rawProfile.max_new_tokens : rawProfile.maxNewTokens;
+
+  let contextWindow = toPositiveInt(contextRaw);
+  let maxInputTokens = toPositiveInt(maxInputRaw);
+  let maxNewTokens = toPositiveInt(maxNewRaw);
+
+  if (!contextWindow) contextWindow = defaultProfile.contextWindow;
+  if (!maxInputTokens) maxInputTokens = defaultProfile.maxInputTokens;
+  if (!maxNewTokens) maxNewTokens = defaultProfile.maxNewTokens;
+
+  if (maxInputTokens > contextWindow) {
+    console.warn(`⚠ model.profile.adjusted model=${modelKey} field=max_input_tokens from=${maxInputTokens} to=${contextWindow}`);
+    maxInputTokens = contextWindow;
+  }
+  if (maxNewTokens > contextWindow) {
+    console.warn(`⚠ model.profile.adjusted model=${modelKey} field=max_new_tokens from=${maxNewTokens} to=${contextWindow}`);
+    maxNewTokens = contextWindow;
+  }
+
+  return {
+    contextWindow,
+    maxInputTokens,
+    maxNewTokens,
+    source: 'configured'
+  };
+}
+
+function resolveTokenBudgetDecision(
+  openaiRequest,
+  modelProfile,
+  requestId,
+  estimatedInputTokensOverride = null,
+  options = {}
+) {
+  const logDecision = options && options.logDecision !== false;
+  const suppressWarnings = options && options.suppressWarnings === true;
+  const hasMaxCompletionTokens = openaiRequest && openaiRequest.max_completion_tokens !== undefined;
+  const hasMaxTokens = openaiRequest && openaiRequest.max_tokens !== undefined;
+  const parsedMaxCompletionTokens = hasMaxCompletionTokens ? toPositiveInt(openaiRequest.max_completion_tokens) : null;
+  const parsedMaxTokens = hasMaxTokens ? toPositiveInt(openaiRequest.max_tokens) : null;
+  const estimatedInputTokens = estimatedInputTokensOverride === null || estimatedInputTokensOverride === undefined
+    ? estimateInputTokens(openaiRequest)
+    : Math.max(0, Math.floor(Number(estimatedInputTokensOverride) || 0));
+
+  let requestedOutputTokens = null;
+  let requestField = null;
+  if (parsedMaxCompletionTokens) {
+    requestedOutputTokens = parsedMaxCompletionTokens;
+    requestField = 'max_completion_tokens';
+  } else if (parsedMaxTokens) {
+    requestedOutputTokens = parsedMaxTokens;
+    requestField = 'max_tokens';
+  }
+
+  if (!suppressWarnings && hasMaxCompletionTokens && !parsedMaxCompletionTokens) {
+    console.warn(`[${requestId}] ⚠ model.profile.output_budget.invalid field=max_completion_tokens value=${openaiRequest.max_completion_tokens}`);
+  }
+  if (!suppressWarnings && hasMaxTokens && !parsedMaxTokens) {
+    console.warn(`[${requestId}] ⚠ model.profile.output_budget.invalid field=max_tokens value=${openaiRequest.max_tokens}`);
+  }
+
+  const maxOutputByContext = Math.max(1, modelProfile.contextWindow - 1);
+  const maxOutputTokens = Math.min(modelProfile.maxNewTokens, maxOutputByContext);
+  const defaultReservedOutputTokens = Math.min(maxOutputTokens, TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS);
+  const requestedOrDefault = requestedOutputTokens || defaultReservedOutputTokens;
+  if (!suppressWarnings && requestedOrDefault > maxOutputTokens) {
+    console.warn(
+      `[${requestId}] ⚠ model.profile.output_budget.clamped ` +
+      `requested=${requestedOrDefault} max_new_tokens=${maxOutputTokens}`
+    );
+  }
+  const reservedOutputTokens = Math.min(requestedOrDefault, maxOutputTokens);
+  const source = requestField || 'profile_default';
+  const availableInputByContext = Math.max(1, modelProfile.contextWindow - reservedOutputTokens);
+  const availableInputTokens = Math.min(modelProfile.maxInputTokens, availableInputByContext);
+  const outputClamped = reservedOutputTokens < requestedOrDefault;
+  const action = estimatedInputTokens > availableInputTokens
+    ? 'reject'
+    : (outputClamped ? 'clamp' : 'pass');
+  const reason = action === 'reject'
+    ? 'input_exceeds_available_budget'
+    : (outputClamped ? 'output_clamped' : 'within_budget');
+
+  if (logDecision) {
+    console.log(
+      `[${requestId}] model.profile.input_budget ` +
+      `estimated_input_tokens=${estimatedInputTokens} available_input_tokens=${availableInputTokens} ` +
+      `reserved_output_tokens=${reservedOutputTokens} action=${action} reason=${reason}`
+    );
+
+    console.log(
+      `[${requestId}] model.profile.output_budget source=${source} ` +
+      `effective_max_tokens=${reservedOutputTokens} max_new_tokens=${maxOutputTokens}`
+    );
+  }
+
+  return {
+    estimatedInputTokens,
+    reservedOutputTokens,
+    availableInputTokens,
+    action,
+    reason
+  };
+}
+
+function observeBudgetDecision(res, requestId, model, tokenBudgetDecision, contextManagement) {
+  const safeModel = String(model || 'unknown');
+  const decision = tokenBudgetDecision && typeof tokenBudgetDecision === 'object'
+    ? tokenBudgetDecision
+    : null;
+  const context = contextManagement && typeof contextManagement === 'object'
+    ? contextManagement
+    : {};
+  const inputBudget = decision
+    ? `${decision.estimatedInputTokens}/${decision.availableInputTokens}`
+    : 'none';
+  const outputBudget = decision
+    ? String(decision.reservedOutputTokens)
+    : 'none';
+  const truncationApplied = Boolean(context.truncationApplied);
+  const rejectReason = decision && decision.action === 'reject'
+    ? String(decision.reason || 'input_exceeds_available_budget')
+    : 'none';
+
+  if (res && res.locals) {
+    res.locals.model = safeModel;
+    res.locals.inputBudget = inputBudget;
+    res.locals.outputBudget = outputBudget;
+    res.locals.truncationApplied = String(truncationApplied);
+    res.locals.rejectReason = rejectReason;
+  }
+
+  if (!requestId) return;
+  console.log(
+    `[${requestId}] model.profile.budget_observation ` +
+    `model=${safeModel} input_budget=${inputBudget} output_budget=${outputBudget} ` +
+    `truncation_applied=${truncationApplied} reject_reason=${rejectReason}`
+  );
+}
+
+function buildModelProfileMap(rawConfig, defaultProfile, modelIds) {
+  const map = new Map();
+
+  const addAliases = (rawKey, profile) => {
+    const modelKey = String(rawKey || '').trim();
+    if (!modelKey) return;
+    const keys = new Set();
+    keys.add(modelKey);
+    const slug = normalizeModelSlug(modelKey);
+    if (slug) keys.add(slug);
+    if (slug) keys.add(`mix/${slug}`);
+    for (const key of keys) {
+      map.set(key, profile);
+    }
+  };
+
+  const modelIdList = Array.isArray(modelIds) ? modelIds : [];
+  for (const modelId of modelIdList) {
+    const modelKey = String(modelId || '').trim();
+    if (!modelKey) continue;
+    addAliases(modelKey, {
+      contextWindow: defaultProfile.contextWindow,
+      maxInputTokens: defaultProfile.maxInputTokens,
+      maxNewTokens: defaultProfile.maxNewTokens,
+      source: 'default'
+    });
+  }
+
+  if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig)) {
+    if (rawConfig !== null && rawConfig !== undefined) {
+      console.warn('⚠ model.profile.invalid reason=config_must_be_object');
+    }
+    return map;
+  }
+
+  for (const [rawKey, rawProfile] of Object.entries(rawConfig)) {
+    const modelKey = String(rawKey || '').trim();
+    if (!modelKey) continue;
+    const normalized = normalizeModelProfileEntry(modelKey, rawProfile, defaultProfile);
+    if (!normalized) continue;
+    addAliases(modelKey, normalized);
+  }
+  return map;
+}
+
+function rememberModelProfileFallbackWarn(modelId) {
+  if (modelProfileFallbackWarned.has(modelId)) return false;
+  if (modelProfileFallbackWarned.size >= MODEL_PROFILE_FALLBACK_WARN_CACHE_SIZE) {
+    const oldest = modelProfileFallbackWarned.values().next().value;
+    if (oldest !== undefined) modelProfileFallbackWarned.delete(oldest);
+  }
+  modelProfileFallbackWarned.add(modelId);
+  return true;
+}
+
+function warnModelProfileFallback(modelId, reason, profile) {
+  if (!rememberModelProfileFallbackWarn(modelId)) return;
+  console.warn(
+    `⚠ model.profile.fallback model=${modelId} reason=${reason} ` +
+    `context_window=${profile.contextWindow} max_input_tokens=${profile.maxInputTokens} max_new_tokens=${profile.maxNewTokens}`
+  );
+}
+
+const DEFAULT_MODEL_PROFILE = buildDefaultModelProfile();
+const MODEL_PROFILE_MODEL_IDS = resolveModelIds();
+const MODEL_PROFILE_MAP = buildModelProfileMap(MODEL_PROFILE_JSON, DEFAULT_MODEL_PROFILE, MODEL_PROFILE_MODEL_IDS);
+
+function resolveModelProfile(model, requestId) {
+  const modelId = String(model || '').trim() || '_default';
+  const slug = normalizeModelSlug(modelId);
+  const candidates = [];
+  for (const c of [modelId, slug, `mix/${slug}`]) {
+    const key = String(c || '').trim();
+    if (!key) continue;
+    if (!candidates.includes(key)) candidates.push(key);
+  }
+
+  let profile = null;
+  for (const key of candidates) {
+    if (MODEL_PROFILE_MAP.has(key)) {
+      profile = MODEL_PROFILE_MAP.get(key);
+      break;
+    }
+  }
+
+  if (profile && profile.source !== 'configured') {
+    warnModelProfileFallback(modelId, 'model_list_default', profile);
+  }
+
+  if (!profile) {
+    profile = {
+      contextWindow: DEFAULT_MODEL_PROFILE.contextWindow,
+      maxInputTokens: DEFAULT_MODEL_PROFILE.maxInputTokens,
+      maxNewTokens: DEFAULT_MODEL_PROFILE.maxNewTokens,
+      source: 'default'
+    };
+    warnModelProfileFallback(modelId, 'not_configured', profile);
+  }
+
+  if (requestId) {
+    console.log(
+      `[${requestId}] model.profile model=${modelId} ` +
+      `context_window=${profile.contextWindow} ` +
+      `max_input_tokens=${profile.maxInputTokens} ` +
+      `max_new_tokens=${profile.maxNewTokens} source=${profile.source}`
+    );
+  }
+
+  return {
+    contextWindow: profile.contextWindow,
+    maxInputTokens: profile.maxInputTokens,
+    maxNewTokens: profile.maxNewTokens,
+    source: profile.source
+  };
+}
+
 // 从上游 SSE START 帧中提取 exchangeId 和 sessionId
 // 参考实际响应格式：
 // {"type":"start","messageMetadata":{"sessionId":"48d73bfd-...","exchangeId":"8e42f4e2-..."},"messageId":"8e42f4e2-..."}
@@ -1012,6 +1373,141 @@ function trimMessagesForUpstream(messages) {
     return cloned;
   });
   return system ? [system, ...trimmedTail] : trimmedTail;
+}
+
+function cloneMessageWithTrimmedContent(message, maxChars, marker = '[消息内容已截断]') {
+  const cloned = { ...message };
+  if (cloned && cloned.content != null) {
+    const t = extractMessageText(cloned.content);
+    cloned.content = (maxChars > 0) ? truncateTextKeepHeadAndTail(t, maxChars, marker) : t;
+  }
+  return cloned;
+}
+
+function adjustKeepStartForToolChain(nonSystemMessages, keepStart) {
+  if (!Array.isArray(nonSystemMessages) || nonSystemMessages.length === 0) return 0;
+  let start = Math.max(0, Math.min(nonSystemMessages.length, keepStart));
+
+  // 避免从 tool 消息中间截断，回退到对应 assistant(tool_calls) 起点
+  while (start > 0 && nonSystemMessages[start] && nonSystemMessages[start].role === 'tool') {
+    start--;
+  }
+
+  if (start > 0) {
+    const current = nonSystemMessages[start];
+    const next = nonSystemMessages[start + 1];
+    const startsToolChain = current
+      && current.role === 'assistant'
+      && Array.isArray(current.tool_calls)
+      && current.tool_calls.length > 0
+      && next
+      && next.role === 'tool';
+    if (startsToolChain) {
+      // 优先回退到该链路前最近一条 user，保留“问题 -> tool -> 结果”最小闭环
+      for (let i = start - 1; i >= 0; i--) {
+        if (nonSystemMessages[i] && nonSystemMessages[i].role === 'user') {
+          start = i;
+          break;
+        }
+      }
+    }
+  }
+
+  return start;
+}
+
+function summarizeTrimmedHistory(messages, maxChars, maxLines) {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+
+  const lineLimit = Math.max(1, toPositiveInt(maxLines) || 10);
+  const lines = [];
+  const tail = messages.slice(-lineLimit);
+
+  for (const msg of tail) {
+    if (!msg || typeof msg !== 'object') continue;
+    const role = String(msg.role || 'message');
+    const roleLabel = role === 'user'
+      ? 'User'
+      : role === 'assistant'
+        ? 'Assistant'
+        : role === 'tool'
+          ? `Tool(${msg.name || 'tool'})`
+          : role;
+    let text = extractMessageText(msg.content);
+    if (!text && role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      const names = msg.tool_calls
+        .map((c) => (c && c.function && c.function.name) ? c.function.name : (c && c.name) ? c.name : 'tool')
+        .slice(0, 5);
+      text = `[调用工具: ${names.join(', ')}]`;
+    }
+    if (!text) continue;
+    const compact = text.replace(/\s+/g, ' ').trim();
+    if (!compact) continue;
+    lines.push(`${roleLabel}: ${truncateTextKeepHeadAndTail(compact, 180, '[内容已压缩]')}`);
+  }
+
+  if (lines.length === 0) return '';
+
+  const summary = [
+    '以下为较早历史消息的压缩摘要，用于保持上下文连续性：',
+    ...lines
+  ].join('\n');
+  const budget = Math.max(1, toPositiveInt(maxChars) || 600);
+  return truncateTextKeepHeadAndTail(summary, budget, '[历史摘要已截断]');
+}
+
+function buildBudgetManagedMessages(messages, options = {}) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return {
+      messages: Array.isArray(messages) ? messages : [],
+      truncationApplied: false,
+      droppedMessageCount: 0,
+      summaryApplied: false,
+      summaryText: ''
+    };
+  }
+
+  const recentMessageCount = Math.max(1, toPositiveInt(options.recentMessageCount) || toPositiveInt(envInt('BUDGET_TRIM_RECENT_MESSAGES', 6)) || 6);
+  const perMessageMaxChars = Math.max(64, toPositiveInt(options.perMessageMaxChars) || toPositiveInt(envInt('BUDGET_TRIM_MESSAGE_MAX_CHARS', 1200)) || 1200);
+  const summaryEnabled = options.summaryEnabled === undefined
+    ? envBool('BUDGET_HISTORY_SUMMARY_ENABLED', false)
+    : Boolean(options.summaryEnabled);
+  const summaryMaxChars = Math.max(128, toPositiveInt(options.summaryMaxChars) || toPositiveInt(envInt('BUDGET_HISTORY_SUMMARY_MAX_CHARS', 600)) || 600);
+  const summaryMaxLines = Math.max(1, toPositiveInt(options.summaryMaxLines) || toPositiveInt(envInt('BUDGET_HISTORY_SUMMARY_MAX_LINES', 10)) || 10);
+
+  const firstSystem = messages.find((m) => m && m.role === 'system') || null;
+  const nonSystem = messages.filter((m) => m && m.role !== 'system');
+  const keepStartRaw = Math.max(0, nonSystem.length - recentMessageCount);
+  const keepStart = adjustKeepStartForToolChain(nonSystem, keepStartRaw);
+
+  const keptRawNonSystem = nonSystem.slice(keepStart);
+  const keptNonSystem = keptRawNonSystem
+    .map((m) => cloneMessageWithTrimmedContent(m, perMessageMaxChars));
+  const keptSet = new Set(keptRawNonSystem);
+
+  const normalizedSystem = firstSystem ? cloneMessageWithTrimmedContent(firstSystem, perMessageMaxChars, '[系统提示已截断]') : null;
+  const managedMessages = normalizedSystem ? [normalizedSystem, ...keptNonSystem] : keptNonSystem;
+
+  // 按原始顺序找出被裁剪掉的历史（用于可选摘要）
+  const droppedMessages = [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    if (normalizedSystem && msg === firstSystem) continue;
+    if (keptSet.has(msg)) continue;
+    droppedMessages.push(msg);
+  }
+
+  const summaryText = summaryEnabled
+    ? summarizeTrimmedHistory(droppedMessages, summaryMaxChars, summaryMaxLines)
+    : '';
+
+  return {
+    messages: managedMessages,
+    truncationApplied: droppedMessages.length > 0,
+    droppedMessageCount: droppedMessages.length,
+    summaryApplied: Boolean(summaryText),
+    summaryText
+  };
 }
 
 function reduceTools(tools, maxCount, descMaxChars, messages) {
@@ -1502,8 +1998,32 @@ function normalizeOpenAIRequestTooling(input) {
 }
 
 // OpenAI 格式转上游格式 (完整传递，支持工具调用)
-function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession) {
-  const lastMessage = openaiRequest.messages[openaiRequest.messages.length - 1];
+function convertToUpstreamFormat(
+  openaiRequest,
+  sessionId,
+  exchangeId,
+  personaId,
+  storedSession,
+  modelProfile,
+  tokenBudgetDecision,
+  requestId,
+  contextManagementOptions = {}
+) {
+  const contextMode = contextManagementOptions && contextManagementOptions.mode === 'budget_recover'
+    ? 'budget_recover'
+    : 'normal';
+  const defaultContextManagement = {
+    messages: Array.isArray(openaiRequest.messages) ? openaiRequest.messages : [],
+    truncationApplied: false,
+    droppedMessageCount: 0,
+    summaryApplied: false,
+    summaryText: ''
+  };
+  const contextManagement = contextMode === 'budget_recover'
+    ? buildBudgetManagedMessages(openaiRequest.messages, contextManagementOptions)
+    : defaultContextManagement;
+  const workingMessages = Array.isArray(contextManagement.messages) ? contextManagement.messages : [];
+  const lastMessage = workingMessages[workingMessages.length - 1];
   const rawTools = Array.isArray(openaiRequest.tools) ? openaiRequest.tools : [];
   
   // 工具策略：
@@ -1515,7 +2035,7 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   
   const toolMaxCount = Number(process.env.TOOL_MAX_COUNT || 15);
   const toolDescMaxChars = Number(process.env.TOOL_DESC_MAX_CHARS || 200);
-  const tools = hasToolsInRequest ? reduceTools(rawTools, toolMaxCount, toolDescMaxChars, openaiRequest.messages) : [];
+  const tools = hasToolsInRequest ? reduceTools(rawTools, toolMaxCount, toolDescMaxChars, workingMessages) : [];
   const toolMode = tools.length > 0;
   const sendUpstreamTools = envBool('SEND_UPSTREAM_TOOLS', false);
   const shouldSendUpstreamTools = sendUpstreamTools && (isNewSession || (turnCount > 0 && turnCount % 20 === 0));
@@ -1534,7 +2054,7 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
     const selectedNames = tools.map(toolNameOf).filter(Boolean);
     console.log(`🧰 Selected tools (${selectedNames.length}/${rawTools.length}): ${selectedNames.join(', ')}`);
   }
-  const trailingToolMessages = collectTrailingToolMessages(openaiRequest.messages);
+  const trailingToolMessages = collectTrailingToolMessages(workingMessages);
   const hasToolResults = trailingToolMessages.length > 0;
 
   // 注意：当本轮是“工具已执行完成 → 请求模型总结/回答”时，不要强制再次调用工具
@@ -1542,7 +2062,7 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   const toolInstruction = toolMode ? buildToolInstruction(tools, forceToolCall) : '';
 
   // OpenAI 工具调用闭环：如果最后一条是 tool，则 query 应该基于最后一个 user 问题 + 工具结果
-  const lastUser = findLastMessageByRole(openaiRequest.messages, 'user');
+  const lastUser = findLastMessageByRole(workingMessages, 'user');
   const baseUserText = extractMessageText(lastUser ? lastUser.content : (lastMessage && lastMessage.content));
   const toolResultsText = formatToolResultsForPrompt(trailingToolMessages);
 
@@ -1551,7 +2071,11 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   // 2. 如果是新会话（无 session_id），可选择性拼接对话历史
   const hasSession = sessionId && sessionId !== 'new';
   const shouldIncludeContext = envBool('INCLUDE_CONTEXT_IN_QUERY', true) && !hasSession;
-  const conversationText = shouldIncludeContext ? formatConversationForQuery(openaiRequest.messages) : '';
+  const conversationBaseText = shouldIncludeContext ? formatConversationForQuery(workingMessages) : '';
+  const summaryMemoryText = (shouldIncludeContext && contextManagement.summaryApplied && contextManagement.summaryText)
+    ? `[历史摘要记忆]\n${contextManagement.summaryText}`
+    : '';
+  const conversationText = [summaryMemoryText, conversationBaseText].filter(Boolean).join('\n\n');
 
   if (hasSession) {
     console.log(`ℹ Using session_id_fp=${fingerprint(sessionId)}, context managed by backend`);
@@ -1563,7 +2087,9 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   const injectIntoQuery = toolMode && (toolInstructionMode === 'query' || toolInstructionMode === 'both');
   const injectIntoMessages = toolMode && (toolInstructionMode === 'messages' || toolInstructionMode === 'both');
   // query 做总长度保护：优先分段裁剪（工具结果/对话历史/工具协议），避免整体截断导致“当前问题”丢失
-  const queryMaxChars = envInt('QUERY_MAX_CHARS', 30_000);
+  const inputCharBudget = Math.max(1, tokenBudgetDecision.availableInputTokens * 4);
+  const queryMaxCharsConfigured = toPositiveInt(envInt('QUERY_MAX_CHARS', 30_000)) || 30_000;
+  const queryMaxChars = Math.min(queryMaxCharsConfigured, inputCharBudget);
   const safeQuery = buildSafeQueryForUpstream({
     conversationText,
     toolResultsText,
@@ -1584,9 +2110,10 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   const modelSlug = normalizeModelSlug(openaiRequest.model);
   
   // 构建基础请求
-  const systemMaxChars = Number(process.env.SYSTEM_PROMPT_MAX_CHARS || 10000);
-  const safeMessages = toolMode ? trimSystemMessages(openaiRequest.messages, systemMaxChars) : openaiRequest.messages;
-  if (toolMode && openaiRequest.messages !== safeMessages) {
+  const systemPromptConfigured = toPositiveInt(process.env.SYSTEM_PROMPT_MAX_CHARS) || 10_000;
+  const systemMaxChars = Math.min(systemPromptConfigured, inputCharBudget);
+  const safeMessages = toolMode ? trimSystemMessages(workingMessages, systemMaxChars) : workingMessages;
+  if (toolMode && workingMessages !== safeMessages) {
     console.log(`⚠ System prompt trimmed to ${systemMaxChars} chars to avoid token overflow`);
   }
 
@@ -1643,9 +2170,7 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
     if (openaiRequest.top_p !== undefined) {
       upstreamRequest.top_p = openaiRequest.top_p;
     }
-    if (openaiRequest.max_tokens !== undefined) {
-      upstreamRequest.max_tokens = openaiRequest.max_tokens;
-    }
+    upstreamRequest.max_tokens = tokenBudgetDecision.reservedOutputTokens;
   
   
   // 只有在提供了有效 session_id 时才添加
@@ -1656,8 +2181,25 @@ function convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId
   if (exchangeId && exchangeId !== 'new') {
     upstreamRequest.exchange_id = exchangeId;
   }
-  
-  return { upstreamRequest, toolMode, hasToolResults };
+
+  const contextManagementResult = {
+    mode: contextMode,
+    truncationApplied: contextManagement.truncationApplied,
+    summaryApplied: contextManagement.summaryApplied,
+    droppedMessageCount: contextManagement.droppedMessageCount,
+    keptMessageCount: workingMessages.length
+  };
+
+  if (contextMode === 'budget_recover') {
+    console.log(
+      `[${requestId}] model.profile.context_management ` +
+      `mode=${contextManagementResult.mode} truncation_applied=${contextManagementResult.truncationApplied} ` +
+      `summary_applied=${contextManagementResult.summaryApplied} dropped_messages=${contextManagementResult.droppedMessageCount} ` +
+      `kept_messages=${contextManagementResult.keptMessageCount}`
+    );
+  }
+
+  return { upstreamRequest, toolMode, hasToolResults, contextManagement: contextManagementResult };
 }
 
 function extractTextFromUpstreamResponse(input) {
@@ -2429,12 +2971,23 @@ async function handleChatCompletion(req, res) {
       });
     }
 
+    const modelProfile = resolveModelProfile(openaiRequest.model, requestId);
+    const outputBudgetBase = resolveTokenBudgetDecision(
+      openaiRequest,
+      modelProfile,
+      requestId,
+      0,
+      { logDecision: false, suppressWarnings: true }
+    );
+
     const requestClient = inferClientId(req);
     const clientWantsStream = openaiRequest.stream !== false;
     const toolsPresent = Array.isArray(openaiRequest.tools) && openaiRequest.tools.length > 0;
     res.locals.client = requestClient;
     res.locals.stream = String(clientWantsStream);
     res.locals.toolsPresent = String(toolsPresent);
+    res.locals.model = String(openaiRequest.model || 'unknown');
+    res.locals.modelProfileSource = modelProfile.source;
 
     let upstreamToken = null;
     if (upstreamAuthMode === 'pass_through') {
@@ -2574,8 +3127,70 @@ async function handleChatCompletion(req, res) {
     ) || null;
     
     // 转换请求格式（完整传递，支持工具调用）
-    const { upstreamRequest, toolMode, hasToolResults } = convertToUpstreamFormat(openaiRequest, sessionId, exchangeId, personaId, storedSession);
-    
+    let {
+      upstreamRequest,
+      toolMode,
+      hasToolResults,
+      contextManagement
+    } = convertToUpstreamFormat(
+      openaiRequest,
+      sessionId,
+      exchangeId,
+      personaId,
+      storedSession,
+      modelProfile,
+      outputBudgetBase,
+      requestId
+    );
+
+    const tokenBudgetDecision = resolveTokenBudgetDecision(
+      openaiRequest,
+      modelProfile,
+      requestId,
+      estimateUpstreamInputTokens(upstreamRequest)
+    );
+    let effectiveTokenBudgetDecision = tokenBudgetDecision;
+    if (effectiveTokenBudgetDecision.action === 'reject') {
+      // 二次机会：触发“保 system + 最近关键消息 + 可选摘要记忆块”的上下文管理策略
+      const recovered = convertToUpstreamFormat(
+        openaiRequest,
+        sessionId,
+        exchangeId,
+        personaId,
+        storedSession,
+        modelProfile,
+        outputBudgetBase,
+        requestId,
+        { mode: 'budget_recover' }
+      );
+      const recoveredDecision = resolveTokenBudgetDecision(
+        openaiRequest,
+        modelProfile,
+        requestId,
+        estimateUpstreamInputTokens(recovered.upstreamRequest)
+      );
+      contextManagement = recovered.contextManagement;
+      if (recoveredDecision.action !== 'reject') {
+        upstreamRequest = recovered.upstreamRequest;
+        toolMode = recovered.toolMode;
+        hasToolResults = recovered.hasToolResults;
+        effectiveTokenBudgetDecision = recoveredDecision;
+      }
+    }
+    observeBudgetDecision(res, requestId, openaiRequest.model, effectiveTokenBudgetDecision, contextManagement);
+    if (effectiveTokenBudgetDecision.action === 'reject') {
+      setRequestEndReason(res, 'invalid_request');
+      return sendOpenAIError(res, 400, {
+        message: (
+          `Input exceeds available input budget (${effectiveTokenBudgetDecision.estimatedInputTokens} > ` +
+          `${effectiveTokenBudgetDecision.availableInputTokens}); reduce messages/tools or max_tokens`
+        ),
+        type: 'invalid_request_error',
+        code: 'context_length_exceeded',
+        param: 'messages'
+      });
+    }
+
     console.log(`[${requestId}] 🔧 toolMode=${toolMode}, hasToolResults=${hasToolResults}, stream=${upstreamRequest.stream}, turnCount=${storedSession ? storedSession.turnCount : 0}`);
     
     const logBodies = envBool('LOG_BODIES', false);

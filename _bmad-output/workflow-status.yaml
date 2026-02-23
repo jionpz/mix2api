@@ -1,7 +1,7 @@
 ---
 project_name: mix2api
-last_updated: '2026-02-12'
-current_workflow: 'correct-course'
+last_updated: '2026-02-24'
+current_workflow: 'release-readiness'
 completed_workflows:
   - brainstorming
   - research-domain
@@ -13,6 +13,7 @@ completed_workflows:
   - check-implementation-readiness
   - sprint-planning
   - sprint-status
+  - release-readiness
   - create-story
   - dev-story
   - retrospective
@@ -52,8 +53,15 @@ outputs:
   story_5_2: '_bmad-output/implementation-artifacts/5-2-可选采样留痕与-1-天保留策略.md'
   story_5_3: '_bmad-output/implementation-artifacts/5-3-接入文档与-openapi-契约文档交付.md'
   story_5_4: '_bmad-output/implementation-artifacts/5-4-回归包-a-b-c-与发布门禁流程.md'
+  story_6_1: '_bmad-output/implementation-artifacts/6-1-模型能力画像与令牌上限配置.md'
+  story_6_2: '_bmad-output/implementation-artifacts/6-2-动态输入预算计算与请求前预检.md'
+  story_6_3: '_bmad-output/implementation-artifacts/6-3-历史消息裁剪与可回溯摘要策略.md'
+  story_6_4: '_bmad-output/implementation-artifacts/6-4-输出令牌参数映射与保护.md'
+  story_6_5: '_bmad-output/implementation-artifacts/6-5-多模型上下文观测与回归矩阵.md'
   retrospective_epic_5: '_bmad-output/implementation-artifacts/epic-5-retro-2026-02-11.md'
+  retrospective_epic_6: '_bmad-output/implementation-artifacts/epic-6-retro-2026-02-24.md'
   release_readiness_2026_02_12: '_bmad-output/implementation-artifacts/release-readiness-2026-02-12.md'
+  release_readiness_2026_02_24: '_bmad-output/implementation-artifacts/release-readiness-2026-02-24.md'
   sprint_change_proposal_2026_02_12: '_bmad-output/planning-artifacts/sprint-change-proposal-2026-02-12.md'
 next_recommended:
   - sprint-status
@@ -131,3 +139,23 @@ notes:
   - 'Completed Epic 4 retrospective and marked epic-4-retrospective as done on 2026-02-12.'
   - 'Created release readiness handoff with gate/test evidence on 2026-02-12.'
   - 'Executed correct-course and implemented upstream-authoritative session bootstrap behavior on 2026-02-12.'
+  - 'Created Story 6.1 and moved it to ready-for-dev on 2026-02-24.'
+  - 'Implemented Story 6.1 and moved it to review on 2026-02-24.'
+  - 'Story 6.1 code-review completed and moved to done on 2026-02-23.'
+  - 'Created Story 6.2 and moved it to ready-for-dev on 2026-02-23.'
+  - 'Implemented Story 6.2 and moved it to review on 2026-02-23.'
+  - 'Story 6.2 code-review found High/Medium issues and moved back to in-progress on 2026-02-23.'
+  - 'Story 6.2 fixed 1 High + 2 Medium findings, added regression tests, and moved to review on 2026-02-24.'
+  - 'Story 6.2 follow-up code-review approved and moved to done on 2026-02-24.'
+  - 'Created Story 6.3 and moved it to ready-for-dev on 2026-02-24.'
+  - 'Implemented Story 6.3 and moved it to review on 2026-02-24.'
+  - 'Story 6.3 code-review approved and moved to done on 2026-02-24.'
+  - 'Created Story 6.4 and moved it to ready-for-dev on 2026-02-24.'
+  - 'Implemented Story 6.4 and moved it to review on 2026-02-24.'
+  - 'Story 6.4 code-review approved and moved to done on 2026-02-24.'
+  - 'Created Story 6.5 and moved it to ready-for-dev on 2026-02-24.'
+  - 'Implemented Story 6.5 and moved it to review on 2026-02-24.'
+  - 'Story 6.5 code-review approved and moved to done on 2026-02-24.'
+  - 'Epic 6 completed on 2026-02-24.'
+  - 'Completed Epic 6 retrospective and marked epic-6-retrospective as done on 2026-02-24.'
+  - 'Created Epic 6 release readiness handoff with full test and gate evidence on 2026-02-24.'

@@ -57,6 +57,12 @@ FR35: 系统可以对日志与留痕数据进行字段级脱敏（Authorization/
 FR36: AI 工程师可以获得接入文档（README）以完成 new-api provider 配置与本地/内网验证。
 FR37: AI 工程师可以获得 OpenAPI 3.0 规范文档用于集成与契约校验。
 FR38: 团队可以运行最小回归包 A/B/C（覆盖 stream、tools、取消/超时）并作为发布门禁。
+FR39: 系统可以维护每个模型的能力画像（context window、最大输入令牌、最大新令牌）并支持配置化管理。
+FR40: 系统可以在请求进入上游前按模型能力画像计算输入/输出令牌预算并执行预检。
+FR41: 系统可以在输入超预算时按策略执行上下文裁剪（保留关键消息、丢弃低价值历史、可选摘要压缩）。
+FR42: 系统可以将客户端 `max_tokens` / `max_completion_tokens` 等参数映射为上游约束并做保护性裁剪。
+FR43: 平台工程师可以观测上下文预算与裁剪结果（触发次数、裁剪比例、拒绝原因）并按模型统计。
+FR44: 团队可以通过多模型上下文回归用例验证不同窗口与令牌上限下的一致性与稳定性。
 
 ### NonFunctional Requirements
 
@@ -133,6 +139,12 @@ FR35: Epic 5 - 字段级脱敏
 FR36: Epic 5 - README 接入文档
 FR37: Epic 5 - OpenAPI 文档
 FR38: Epic 5 - 回归包 A/B/C 门禁
+FR39: Epic 6 - 模型能力画像管理
+FR40: Epic 6 - 令牌预算预检
+FR41: Epic 6 - 上下文裁剪与压缩策略
+FR42: Epic 6 - 输出令牌参数映射与保护
+FR43: Epic 6 - 上下文预算观测
+FR44: Epic 6 - 多模型上下文回归
 
 ## Epic List
 
@@ -155,6 +167,10 @@ AI 工程师可稳定完成 tools/legacy functions 闭环任务，且保持 MCP-
 ### Epic 5: 观测治理与发布门禁
 团队可以在脱敏治理前提下进行可回归、可放量、可回滚的工程化发布。
 **FRs covered:** FR33, FR34, FR35, FR36, FR37, FR38
+
+### Epic 6: 多模型上下文管理与令牌预算自适配
+AI 工程师可以在不同模型约束下稳定完成长对话与工具闭环；平台工程师可以对输入/输出令牌预算进行精细控制与观测。
+**FRs covered:** FR39, FR40, FR41, FR42, FR43, FR44
 
 ## Epic 1: 安全接入与基础对话可用
 
@@ -580,3 +596,107 @@ So that 每次发布都可验证 stream、tools-loop、取消/超时三类关键
 **When** 进入发布决策  
 **Then** 阻断继续放量或触发回滚流程  
 **And** 失败样本可通过 request_id 追踪复盘
+
+## Epic 6: 多模型上下文管理与令牌预算自适配
+
+AI 工程师可以在不同模型约束下稳定完成长对话与工具闭环；平台工程师可以对输入/输出令牌预算进行精细控制与观测。
+
+### Story 6.1: 模型能力画像与令牌上限配置
+
+As a 平台工程师,
+I want 为每个模型维护 context window、最大输入令牌、最大新令牌的统一配置,
+So that 系统可以基于模型差异执行一致的上下文预算决策.
+
+**Implements:** FR39
+
+**Acceptance Criteria:**
+
+**Given** 已配置多个模型能力画像  
+**When** 服务接收对应模型请求  
+**Then** 能读取该模型的 `context_window`、`max_input_tokens`、`max_new_tokens`  
+**And** 未配置模型走保守默认值并输出告警事件
+
+**Given** 配置被更新  
+**When** 服务重新加载配置  
+**Then** 新请求按新约束执行预算  
+**And** 不影响既有 API 契约形态
+
+### Story 6.2: 动态输入预算计算与请求前预检
+
+As a AI 工程师,
+I want 在请求进入上游前完成令牌预算预检,
+So that 不会因为模型输入上限差异导致随机超限失败.
+
+**Implements:** FR40
+
+**Acceptance Criteria:**
+
+**Given** 请求包含 `messages`、可选 `tools` 与目标模型  
+**When** 服务进行预处理  
+**Then** 计算输入估算令牌与可用输入预算  
+**And** 为输出预留安全额度
+
+**Given** 客户端请求的输出令牌过大  
+**When** 预算计算完成  
+**Then** 服务执行保护性裁剪或返回兼容错误  
+**And** 返回信息可用于调用方调整参数
+
+### Story 6.3: 历史消息裁剪与可回溯摘要策略
+
+As a AI 工程师,
+I want 在超预算时按优先级裁剪历史上下文并可选摘要压缩,
+So that 在不同模型窗口下仍能保持对话连续性与关键语义.
+
+**Implements:** FR41
+
+**Acceptance Criteria:**
+
+**Given** 请求输入估算超出模型可用输入预算  
+**When** 触发上下文管理策略  
+**Then** 保留 `system` 与最新轮次关键消息  
+**And** 按策略裁剪较早低价值历史消息
+
+**Given** 裁剪后仍接近上限  
+**When** 摘要策略开启  
+**Then** 服务将被裁剪历史压缩为短摘要记忆块  
+**And** 在观测中记录裁剪与摘要触发信息
+
+### Story 6.4: 输出令牌参数映射与保护
+
+As a 平台工程师,
+I want 将客户端输出令牌参数按模型约束映射到上游并做边界保护,
+So that 不同模型都能得到可预测的输出长度与稳定行为.
+
+**Implements:** FR42
+
+**Acceptance Criteria:**
+
+**Given** 请求包含 `max_tokens` 或 `max_completion_tokens`  
+**When** 服务构造上游请求  
+**Then** 按模型 `max_new_tokens` 上限进行映射与裁剪  
+**And** 不会把非法或超限值透传给上游
+
+**Given** 请求未指定输出令牌参数  
+**When** 服务执行默认策略  
+**Then** 使用模型级默认输出预算  
+**And** 在流式与非流式下行为一致
+
+### Story 6.5: 多模型上下文观测与回归矩阵
+
+As a 平台工程师,
+I want 观测上下文预算执行结果并建立多模型回归矩阵,
+So that 可以持续验证上下文管理策略在不同模型上的稳定性.
+
+**Implements:** FR43, FR44
+
+**Acceptance Criteria:**
+
+**Given** 请求经过预算预检与上下文管理  
+**When** 记录指标与日志  
+**Then** 至少包含 `model`、`input_budget`、`output_budget`、`truncation_applied`、`reject_reason`  
+**And** 可按模型聚合查看触发率与失败率
+
+**Given** 发布前执行回归  
+**When** 覆盖小窗口与大窗口模型场景  
+**Then** 上下文管理相关用例全部通过  
+**And** 失败样本可通过 `request_id` 追踪

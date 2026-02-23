@@ -437,6 +437,873 @@ test('POST /v1/chat/completions stream=true returns SSE chunks with DONE signal'
   assert.equal(requests[0].body?.stream, true);
 });
 
+test('POST /v1/chat/completions resolves configured model profile from MODEL_PROFILE_JSON', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 131072,
+          max_input_tokens: 120000,
+          max_new_tokens: 4096
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'profile configured path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile[^\n]*model=mix\/qwen-3-235b-instruct[^\n]*context_window=131072[^\n]*max_input_tokens=120000[^\n]*max_new_tokens=4096[^\n]*source=configured/);
+});
+
+test('POST /v1/chat/completions falls back to default model profile for unknown model', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 131072,
+          max_input_tokens: 120000,
+          max_new_tokens: 4096
+        }
+      }),
+      MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW: '64000',
+      MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS: '48000',
+      MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS: '2048'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/unknown-context-model',
+      stream: false,
+      messages: [{ role: 'user', content: 'profile fallback path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.fallback[^\n]*model=mix\/unknown-context-model/);
+  assert.match(logs, /model\.profile[^\n]*model=mix\/unknown-context-model[^\n]*context_window=64000[^\n]*max_input_tokens=48000[^\n]*max_new_tokens=2048[^\n]*source=default/);
+});
+
+test('POST /v1/chat/completions applies updated model profile after service reload', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPortA = await getFreePort();
+  const adapterPortB = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterA = await startAdapter({
+    port: adapterPortA,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 1024
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterA);
+    await stopProc(adapterB);
+    await closeServer(upstreamServer);
+  });
+
+  const reqBody = {
+    model: 'mix/qwen-3-235b-instruct',
+    stream: false,
+    messages: [{ role: 'user', content: 'profile reload path' }]
+  };
+
+  const resA = await fetch(`http://127.0.0.1:${adapterPortA}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify(reqBody)
+  });
+  assert.equal(resA.status, 200);
+  await sleep(60);
+
+  await stopProc(adapterA);
+
+  const adapterB = await startAdapter({
+    port: adapterPortB,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 2048
+        }
+      })
+    }
+  });
+
+  const resB = await fetch(`http://127.0.0.1:${adapterPortB}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify(reqBody)
+  });
+  assert.equal(resB.status, 200);
+  await sleep(60);
+
+  const logsA = `${adapterA.__stdout || ''}\n${adapterA.__stderr || ''}`;
+  const logsB = `${adapterB.__stdout || ''}\n${adapterB.__stderr || ''}`;
+  assert.match(logsA, /model\.profile[^\n]*max_new_tokens=1024[^\n]*source=configured/);
+  assert.match(logsB, /model\.profile[^\n]*max_new_tokens=2048[^\n]*source=configured/);
+});
+
+test('POST /v1/chat/completions uses default profile for MODEL_LIST model without explicit profile and logs warning', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_LIST: 'mix/listed-default-model',
+      MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW: '64000',
+      MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS: '48000',
+      MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS: '1024',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 131072,
+          max_input_tokens: 120000,
+          max_new_tokens: 4096
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/listed-default-model',
+      stream: false,
+      messages: [{ role: 'user', content: 'model list default profile path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.fallback[^\n]*model=mix\/listed-default-model[^\n]*reason=model_list_default/);
+  assert.match(logs, /model\.profile[^\n]*model=mix\/listed-default-model[^\n]*context_window=64000[^\n]*max_input_tokens=48000[^\n]*max_new_tokens=1024[^\n]*source=default/);
+});
+
+test('POST /v1/chat/completions normalizes partial/invalid profile fields and clamps to context window', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW: '8192',
+      MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS: '4096',
+      MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS: '1024',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/profile-validate-model': {
+          context_window: 4096,
+          max_input_tokens: 'not-a-number',
+          max_new_tokens: 5000
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/profile-validate-model',
+      stream: false,
+      messages: [{ role: 'user', content: 'profile normalization path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.adjusted[^\n]*model=mix\/profile-validate-model[^\n]*field=max_new_tokens[^\n]*from=5000[^\n]*to=4096/);
+  assert.match(logs, /model\.profile[^\n]*model=mix\/profile-validate-model[^\n]*context_window=4096[^\n]*max_input_tokens=4096[^\n]*max_new_tokens=4096[^\n]*source=configured/);
+});
+
+test('POST /v1/chat/completions rejects requests that exceed model max_input_tokens budget', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 100,
+          max_input_tokens: 10,
+          max_new_tokens: 16
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const longText = 'A'.repeat(500);
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: longText }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.type, 'invalid_request_error');
+  assert.equal(json?.error?.code, 'context_length_exceeded');
+  assert.equal(requests.length, 0);
+});
+
+test('POST /v1/chat/completions maps max_completion_tokens to upstream max_tokens with model max_new_tokens cap', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 128
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      max_completion_tokens: 512,
+      messages: [{ role: 'user', content: 'max tokens mapping path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body?.max_tokens, 128);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.output_budget\.clamped[^\n]*requested=512[^\n]*max_new_tokens=128/);
+  assert.match(logs, /model\.profile\.input_budget[^\n]*available_input_tokens=160000[^\n]*reserved_output_tokens=128[^\n]*action=clamp[^\n]*reason=output_clamped/);
+});
+
+test('POST /v1/chat/completions maps max_tokens to upstream max_tokens with model max_new_tokens cap', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 96
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      max_tokens: 300,
+      messages: [{ role: 'user', content: 'max_tokens mapping path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body?.max_tokens, 96);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.output_budget\.clamped[^\n]*requested=300[^\n]*max_new_tokens=96/);
+});
+
+test('POST /v1/chat/completions falls back to default reserved output budget when max_tokens is invalid', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS: '64',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 256
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      max_tokens: 'not-a-number',
+      messages: [{ role: 'user', content: 'invalid max_tokens fallback path' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body?.max_tokens, 64);
+  await sleep(60);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.output_budget\.invalid[^\n]*field=max_tokens[^\n]*value=not-a-number/);
+  assert.match(logs, /model\.profile\.output_budget[^\n]*source=profile_default[^\n]*effective_max_tokens=64/);
+});
+
+test('POST /v1/chat/completions uses same default output budget for stream and non-stream when output tokens are omitted', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS: '72',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 200000,
+          max_input_tokens: 160000,
+          max_new_tokens: 120
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const nonStreamRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'default output budget non-stream path' }]
+    })
+  });
+  assert.equal(nonStreamRes.status, 200);
+  await nonStreamRes.json();
+
+  const streamRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: true,
+      messages: [{ role: 'user', content: 'default output budget stream path' }]
+    })
+  });
+  assert.equal(streamRes.status, 200);
+  await streamRes.text();
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].body?.max_tokens, 72);
+  assert.equal(requests[1].body?.max_tokens, 72);
+  assert.equal(requests[0].body?.stream, false);
+  assert.equal(requests[1].body?.stream, true);
+});
+
+test('POST /v1/chat/completions reserves output budget before input check and rejects when available input is exceeded', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 120,
+          max_input_tokens: 100,
+          max_new_tokens: 80
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      max_completion_tokens: 70,
+      messages: [{ role: 'user', content: 'A'.repeat(240) }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.type, 'invalid_request_error');
+  assert.equal(json?.error?.code, 'context_length_exceeded');
+  assert.match(String(json?.error?.message || ''), /available input budget/);
+  assert.equal(requests.length, 0);
+});
+
+test('POST /v1/chat/completions includes tools payload in input budget estimation', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 300,
+          max_input_tokens: 90,
+          max_new_tokens: 20
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const longText = 'x'.repeat(4000);
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'budget tools path' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'heavy_tool',
+          description: longText,
+          parameters: {
+            type: 'object',
+            properties: {
+              payload: {
+                type: 'string',
+                description: longText
+              }
+            }
+          }
+        }
+      }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.type, 'invalid_request_error');
+  assert.equal(json?.error?.code, 'context_length_exceeded');
+  assert.equal(requests.length, 0);
+});
+
+test('POST /v1/chat/completions prechecks transformed upstream payload and rejects before upstream call', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 260,
+          max_input_tokens: 150,
+          max_new_tokens: 80
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'B'.repeat(500) }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.type, 'invalid_request_error');
+  assert.equal(json?.error?.code, 'context_length_exceeded');
+  assert.match(String(json?.error?.message || ''), /\(\d+\s*>\s*150\)/);
+  assert.equal(requests.length, 0);
+});
+
+test('POST /v1/chat/completions keeps small available-input budgets aligned without 1024-char floor inflation', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      UPSTREAM_MESSAGES_MAX: '1',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 1000,
+          max_input_tokens: 200,
+          max_new_tokens: 20
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'u'.repeat(380) },
+        { role: 'assistant', content: 'a'.repeat(380) },
+        { role: 'user', content: '' }
+      ]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  const query = String(requests[0].body?.request?.query || '');
+  assert.ok(query.length > 700);
+  assert.ok(query.length <= 800);
+});
+
+test('POST /v1/chat/completions trims low-priority history when initial budget precheck fails', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      INCLUDE_CONTEXT_IN_QUERY: 'true',
+      BUDGET_TRIM_RECENT_MESSAGES: '2',
+      BUDGET_TRIM_MESSAGE_MAX_CHARS: '120',
+      BUDGET_HISTORY_SUMMARY_ENABLED: 'false',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 600,
+          max_input_tokens: 220,
+          max_new_tokens: 40
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const messages = [{ role: 'system', content: `system-${'s'.repeat(320)}` }];
+  for (let i = 0; i < 5; i++) {
+    messages.push({ role: 'user', content: `old-user-${i}-${'u'.repeat(280)}` });
+    messages.push({ role: 'assistant', content: `old-assistant-${i}-${'a'.repeat(280)}` });
+  }
+  messages.push({ role: 'user', content: `latest-question-${'q'.repeat(300)}` });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  const upstreamMessages = Array.isArray(requests[0].body?.messages) ? requests[0].body.messages : [];
+  assert.ok(upstreamMessages.length > 0);
+  assert.ok(upstreamMessages.length < messages.length);
+  assert.equal(upstreamMessages[0]?.role, 'system');
+  assert.match(String(upstreamMessages[upstreamMessages.length - 1]?.content || ''), /latest-question/);
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.context_management[^\n]*truncation_applied=true[^\n]*summary_applied=false/);
+});
+
+test('POST /v1/chat/completions injects optional history summary memory block after truncation', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer, requests } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      INCLUDE_CONTEXT_IN_QUERY: 'true',
+      BUDGET_TRIM_RECENT_MESSAGES: '2',
+      BUDGET_TRIM_MESSAGE_MAX_CHARS: '120',
+      BUDGET_HISTORY_SUMMARY_ENABLED: 'true',
+      BUDGET_HISTORY_SUMMARY_MAX_CHARS: '420',
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/qwen-3-235b-instruct': {
+          context_window: 800,
+          max_input_tokens: 320,
+          max_new_tokens: 40
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const messages = [{ role: 'system', content: `system-${'s'.repeat(320)}` }];
+  for (let i = 0; i < 5; i++) {
+    messages.push({ role: 'user', content: `old-user-${i}-${'u'.repeat(280)}` });
+    messages.push({ role: 'assistant', content: `old-assistant-${i}-${'a'.repeat(280)}` });
+  }
+  messages.push({ role: 'user', content: `latest-question-${'q'.repeat(300)}` });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages
+    })
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(requests.length, 1);
+  const query = String(requests[0].body?.request?.query || '');
+  assert.match(query, /\[历史摘要记忆\]/);
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /model\.profile\.context_management[^\n]*truncation_applied=true[^\n]*summary_applied=true/);
+});
+
+test('POST /v1/chat/completions bounds fallback warning cache size to avoid unbounded growth', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_FALLBACK_WARN_CACHE_SIZE: '2'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const makeReq = (model) => fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      messages: [{ role: 'user', content: `cache-bounds-${model}` }]
+    })
+  });
+
+  assert.equal((await makeReq('mix/cache-a')).status, 200);
+  assert.equal((await makeReq('mix/cache-b')).status, 200);
+  assert.equal((await makeReq('mix/cache-c')).status, 200);
+  assert.equal((await makeReq('mix/cache-a')).status, 200);
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  const matches = logs.match(/model\.profile\.fallback[^\n]*model=mix\/cache-a/g) || [];
+  assert.equal(matches.length, 2);
+});
+
 test('POST /v1/chat/completions stream=true keeps SSE output when upstream replies JSON', async (t) => {
   const upstreamPort = await getFreePort();
   const adapterPort = await getFreePort();
@@ -1370,6 +2237,11 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for succ
   assert.match(logs, /request\.completed[^\n]*client=opencode/);
   assert.match(logs, /request\.completed[^\n]*stream=true/);
   assert.match(logs, /request\.completed[^\n]*tools_present=true/);
+  assert.match(logs, /request\.completed[^\n]*model=mix\/qwen-3-235b-instruct/);
+  assert.match(logs, /request\.completed[^\n]*input_budget=\d+\/\d+/);
+  assert.match(logs, /request\.completed[^\n]*output_budget=\d+/);
+  assert.match(logs, /request\.completed[^\n]*truncation_applied=(true|false)/);
+  assert.match(logs, /request\.completed[^\n]*reject_reason=none/);
   assert.match(logs, /request\.completed[^\n]*end_reason=stop/);
   assert.match(logs, /request\.completed[^\n]*http_status=200/);
   assert.match(logs, /request\.completed[^\n]*upstream_status=200/);
@@ -1406,9 +2278,98 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for upst
   assert.match(logs, /request\.completed[^\n]*client=claude-code/);
   assert.match(logs, /request\.completed[^\n]*stream=false/);
   assert.match(logs, /request\.completed[^\n]*tools_present=false/);
+  assert.match(logs, /request\.completed[^\n]*model=mix\/qwen-3-235b-instruct/);
+  assert.match(logs, /request\.completed[^\n]*input_budget=\d+\/\d+/);
+  assert.match(logs, /request\.completed[^\n]*output_budget=\d+/);
+  assert.match(logs, /request\.completed[^\n]*truncation_applied=(true|false)/);
+  assert.match(logs, /request\.completed[^\n]*reject_reason=none/);
   assert.match(logs, /request\.completed[^\n]*end_reason=upstream_error/);
   assert.match(logs, /request\.completed[^\n]*http_status=503/);
   assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
+});
+
+test('POST /v1/chat/completions emits budget observation logs with model-level fields and request_id trace for small/large model matrix', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startMockUpstream(upstreamPort);
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    collectLogs: true,
+    env: {
+      MODEL_PROFILE_JSON: JSON.stringify({
+        'mix/small-window-model': {
+          context_window: 260,
+          max_input_tokens: 110,
+          max_new_tokens: 40
+        },
+        'mix/large-window-model': {
+          context_window: 131072,
+          max_input_tokens: 120000,
+          max_new_tokens: 2048
+        }
+      })
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const rejectMessages = [{ role: 'system', content: `system-${'s'.repeat(200)}` }];
+  for (let i = 0; i < 3; i++) {
+    rejectMessages.push({ role: 'user', content: `u-${i}-${'u'.repeat(260)}` });
+    rejectMessages.push({ role: 'assistant', content: `a-${i}-${'a'.repeat(260)}` });
+  }
+  rejectMessages.push({ role: 'user', content: `latest-${'x'.repeat(1200)}` });
+
+  const rejectRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/small-window-model',
+      stream: false,
+      messages: rejectMessages
+    })
+  });
+  assert.equal(rejectRes.status, 400);
+  const rejectRequestId = String(rejectRes.headers.get('x-request-id') || '');
+  assert.ok(rejectRequestId.length > 0);
+
+  const passRes = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/large-window-model',
+      stream: false,
+      messages: [{ role: 'user', content: 'large model budget observation path' }]
+    })
+  });
+  assert.equal(passRes.status, 200);
+  const passRequestId = String(passRes.headers.get('x-request-id') || '');
+  assert.ok(passRequestId.length > 0);
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  const rejectPattern = new RegExp(
+    `\\[${rejectRequestId.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\][^\\n]*model\\.profile\\.budget_observation[^\\n]*` +
+    `model=mix/small-window-model[^\\n]*input_budget=\\d+/\\d+[^\\n]*output_budget=\\d+[^\\n]*` +
+    `truncation_applied=true[^\\n]*reject_reason=input_exceeds_available_budget`
+  );
+  const passPattern = new RegExp(
+    `\\[${passRequestId.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\][^\\n]*model\\.profile\\.budget_observation[^\\n]*` +
+    `model=mix/large-window-model[^\\n]*input_budget=\\d+/\\d+[^\\n]*output_budget=\\d+[^\\n]*` +
+    `truncation_applied=false[^\\n]*reject_reason=none`
+  );
+  assert.match(logs, rejectPattern);
+  assert.match(logs, passPattern);
 });
 
 test('POST /v1/chat/completions redacts sensitive headers in logs when LOG_HEADERS=true', async (t) => {

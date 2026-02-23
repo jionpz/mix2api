@@ -73,6 +73,39 @@ curl -sS http://127.0.0.1:3001/v1/models
 - 第一个可复用 `session_id` 由上游响应返回，适配器写入 session store 后用于后续请求。
 - 如需强制开启新会话，使用 `session_id: "new"`（或 header `x-session-id: new`）。
 
+模型能力画像（多模型上下文预算基础）：
+
+- `MODEL_PROFILE_JSON`：按模型配置 `context_window`、`max_input_tokens`、`max_new_tokens`
+- 未配置模型会回退到默认画像并记录告警日志（`model.profile.fallback`）
+- 输入预算估算会同时考虑 `messages` 与 `tools` 负载
+- 预留输出预算后可用输入预算计算：`available_input_tokens = min(max_input_tokens, context_window - reserved_output_tokens)`
+- 请求输入估算超出模型 `max_input_tokens` 时，返回 `400`（`context_length_exceeded`）
+- 客户端 `max_tokens` / `max_completion_tokens` 会映射并裁剪到模型 `max_new_tokens`
+- 未显式传输出参数时，默认预留由 `TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS` 控制
+- `max_tokens` / `max_completion_tokens` 非法值不会透传，会回退到模型默认输出预算
+- 输出预算映射在 stream 与 non-stream 路径保持一致
+- 若首次预算预检超限，会触发“保留 system + 最近关键消息”的二次裁剪策略；仍超限才返回 `context_length_exceeded`
+- 可选开启历史摘要记忆块（注入 query 的 `[历史摘要记忆]` 段）以在强裁剪下保留早期语义
+- 统一预算观测日志 `model.profile.budget_observation` 包含：`model`、`input_budget`、`output_budget`、`truncation_applied`、`reject_reason`
+- `request.completed` 也会携带同组预算字段，可按 `model` 聚合并结合 `x-request-id` 追踪失败样本
+- 默认画像由以下参数控制：
+  - `MODEL_PROFILE_DEFAULT_CONTEXT_WINDOW`
+  - `MODEL_PROFILE_DEFAULT_MAX_INPUT_TOKENS`
+  - `MODEL_PROFILE_DEFAULT_MAX_NEW_TOKENS`
+  - `TOKEN_BUDGET_DEFAULT_RESERVED_OUTPUT_TOKENS`
+  - `MODEL_PROFILE_FALLBACK_WARN_CACHE_SIZE`（fallback 告警去重缓存上限）
+  - `BUDGET_TRIM_RECENT_MESSAGES`
+  - `BUDGET_TRIM_MESSAGE_MAX_CHARS`
+  - `BUDGET_HISTORY_SUMMARY_ENABLED`
+  - `BUDGET_HISTORY_SUMMARY_MAX_CHARS`
+  - `BUDGET_HISTORY_SUMMARY_MAX_LINES`
+
+示例：
+
+```bash
+MODEL_PROFILE_JSON='{"mix/qwen-3-235b-instruct":{"context_window":200000,"max_input_tokens":160000,"max_new_tokens":8192}}'
+```
+
 ## 4. 灰度与回滚建议
 
 推荐放量：`0% -> 5% -> 20% -> 50% -> 100%`。每一档至少观察 10 分钟。
