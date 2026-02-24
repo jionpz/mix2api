@@ -172,6 +172,10 @@ AI 工程师可稳定完成 tools/legacy functions 闭环任务，且保持 MCP-
 AI 工程师可以在不同模型约束下稳定完成长对话与工具闭环；平台工程师可以对输入/输出令牌预算进行精细控制与观测。
 **FRs covered:** FR39, FR40, FR41, FR42, FR43, FR44
 
+### Epic 7: 单体解耦与职责分层重构
+团队可以在不改变北向 API 契约与线上行为的前提下，将 `server.js` 迁移为清晰分层结构（routes/controllers/services/repositories/middleware/config），降低回归风险并提升迭代效率。
+**FRs covered:** NFR12, NFR13, NFR17
+
 ## Epic 1: 安全接入与基础对话可用
 
 AI 工程师和平台工程师可以安全接入并完成基础 Chat Completions 能力验证（含基础端点与兼容错误形态）。
@@ -700,3 +704,138 @@ So that 可以持续验证上下文管理策略在不同模型上的稳定性.
 **When** 覆盖小窗口与大窗口模型场景  
 **Then** 上下文管理相关用例全部通过  
 **And** 失败样本可通过 `request_id` 追踪
+
+## Epic 7: 单体解耦与职责分层重构
+
+团队可以在不改变北向 API 契约与线上行为的前提下，将 `server.js` 迁移为清晰分层结构（routes/controllers/services/repositories/middleware/config），降低回归风险并提升迭代效率。
+
+### Story 7.1: 配置与通用工具抽离
+
+As a 平台工程师,  
+I want 将环境变量解析、脱敏、通用工具函数从 `server.js` 抽离到 `config/*` 与 `utils/*`,  
+So that 基础能力可复用且避免同类逻辑分散重复实现.
+
+**Implements:** NFR17, NFR11
+
+**Acceptance Criteria:**
+
+**Given** 项目运行配置读取  
+**When** 服务启动  
+**Then** 统一从 `config/*` 读取并解析配置  
+**And** 不再在业务路径中散布重复 `process.env` 解析
+
+**Given** 需要脱敏与公共字符串处理  
+**When** 日志与错误处理执行  
+**Then** 统一使用 `utils/*` 能力  
+**And** 脱敏口径与现网保持一致
+
+**Given** 完成本阶段抽离  
+**When** 执行端点与回归验证  
+**Then** `/v1/chat/completions`、`/`、`/v1/models`、`/health` 对外契约行为不变  
+**And** 回归包 A/B/C 全部通过后方可进入下一阶段
+
+### Story 7.2: 中间件与路由入口抽离
+
+As a AI 工程师,  
+I want 将 request_id、请求日志、JSON 错误处理和路由注册抽离到 middleware/routes,  
+So that HTTP 入口职责清晰，后续能力扩展不再堆叠在单文件入口.
+
+**Implements:** NFR6, NFR7
+
+**Acceptance Criteria:**
+
+**Given** 任意入站请求  
+**When** 进入服务  
+**Then** `x-request-id` 注入、日志、错误处理由独立 middleware 链完成  
+**And** `server.js` 仅负责装配与启动
+
+**Given** 路由注册完成  
+**When** 查看入口代码  
+**Then** `POST /v1/chat/completions`、`POST /`、`GET /health`、`GET /v1/models` 通过 `routes/*` 注册  
+**And** 对外契约行为保持不变
+
+**Given** 完成本阶段抽离  
+**When** 观测与回归验收  
+**Then** `x-request-id`、`end_reason` 与 `request.completed` 字段口径保持不变  
+**And** 回归包 A/B/C 全部通过后方可进入下一阶段
+
+### Story 7.3: 会话与上游交互服务抽离
+
+As a 平台工程师,  
+I want 将 session store、上游 token 生命周期和上游调用重试逻辑拆分到 services/repositories,  
+So that 状态管理和外部交互可独立测试与演进.
+
+**Implements:** FR19, FR20, FR21, FR22, FR23, NFR17
+
+**Acceptance Criteria:**
+
+**Given** 会话读写与 schema 兼容处理  
+**When** 请求命中/未命中 session  
+**Then** 由 `services/session/*` 与 `repositories/*` 统一处理  
+**And** Redis/内存降级行为与现网一致
+
+**Given** 上游 token 获取与重试  
+**When** 上游鉴权异常或暂时性失败  
+**Then** 由 `services/upstream/*` 统一处理恢复与重试  
+**And** 错误 envelope 与 end_reason 口径不变
+
+**Given** 完成本阶段抽离  
+**When** 进行契约与指标等价性校验  
+**Then** 北向端点行为与现网保持一致  
+**And** 回归包 A/B/C 全部通过后方可进入下一阶段
+
+### Story 7.4: Chat 编排状态机抽离
+
+As a AI 工程师,  
+I want 将 budget 预检、tools 闭环、stream/non-stream 分支编排抽离为可测试状态机服务,  
+So that 功能迭代时能控制影响面并降低回归成本.
+
+**Implements:** FR8, FR9, FR10, FR11, FR12, FR13, FR14, FR15, FR16, FR40, FR41, FR42, FR43
+
+**Acceptance Criteria:**
+
+**Given** chat completion 请求进入服务  
+**When** 执行预算、工具、流式编排  
+**Then** 由 `services/chat/*` 统一承载业务状态机  
+**And** controllers 只负责协议入/出封装
+
+**Given** 发生异常终止  
+**When** 请求完成  
+**Then** `end_reason` 分类口径与现网一致  
+**And** `request.completed` 字段集合不发生破坏性变化
+
+**Given** 完成本阶段抽离  
+**When** 执行迁移准入检查  
+**Then** stream done 覆盖、tools 闭环成功率、非 `client_abort` 失败率不恶化  
+**And** 任一指标超阈值则阻断推进并回退到上阶段基线
+
+### Story 7.5: 回归与等价性验收
+
+As a QA 工程师,  
+I want 在每次模块迁移阶段执行等价性回归,  
+So that 重构不会破坏北向契约和核心稳定性目标.
+
+**Implements:** NFR12, NFR13
+
+**Acceptance Criteria:**
+
+**Given** 任一阶段性迁移完成  
+**When** 执行回归包 A/B/C  
+**Then** stable 与 canary 全部通过  
+**And** 如失败可通过 `request_id` 定位回归点
+
+**Given** 对外契约回归  
+**When** 校验 `/v1/chat/completions`、`/v1/models`、`/health`、`/`  
+**Then** 字段与行为保持向后兼容  
+**And** 不引入破坏性变更
+
+**Given** 执行阶段性质量门禁  
+**When** 统计 rolling 24h（排除 `client_abort`）指标  
+**Then** `[DONE]` 覆盖率 `>=99.5%` 且断流率 `<=0.5%`  
+**And** `tool_calls` 闭环成功率 `>=97%` 且回归包 B 通过率 `=100%`  
+**And** `end_reason != unknown` 覆盖率 `>=99%` 且漂移率 `<=5%`
+
+**Given** 任一阶段完成并准备进入下一阶段  
+**When** 输出阶段验收材料  
+**Then** 必须生成等价性报告（样本、`request_id`、差异结论、准入结论）  
+**And** 任一阈值未达标即阻断推进并回退到上阶段基线

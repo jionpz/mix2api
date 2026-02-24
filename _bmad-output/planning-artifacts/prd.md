@@ -143,6 +143,7 @@ date: '2026-02-11'
 - 观测增强：更细粒度 end_reason 分型、Top N 失败样本自动采集（仍遵循脱敏与留存策略）
 - 工程化稳定性：SSE 链路专项压测、代理/网关配置基线、连接复用与超时策略固化
 - 配置与运维：更完善的运行手册、告警阈值与自动回滚联动
+- 单体解耦重构：将 `server.js` 增量迁移为 `routes/controllers/services/repositories/middleware/config` 分层结构；以“北向契约零破坏 + 回归包 A/B/C 全绿”为迁移验收门槛。
 
 **Phase 3 (Expansion):**
 - 新北向能力（例如 `/responses`）与更复杂场景的兼容性扩展（单独验收与回归矩阵）

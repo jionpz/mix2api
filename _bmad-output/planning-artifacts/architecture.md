@@ -270,6 +270,22 @@ N/A（本项目为 API backend / adapter，无前端架构决策）
 3. 接入 Redis 最小状态并验证 stable/canary 一致性
 4. 建立回归包 A/B/C 与灰度回滚自动化门禁
 
+**Server.js Incremental Modularization Plan:**
+1. Stage 1 - 抽离 `config/*` 与 `utils/*`（仅迁移配置解析与通用能力）
+2. Stage 2 - 抽离 `middleware/*` 与 `routes/*`（入口只保留装配职责）
+3. Stage 3 - 抽离 `services/session/*` 与 `services/upstream/*`（状态与外部交互分层）
+4. Stage 4 - 抽离 `services/chat/*` 编排状态机（budget/tool-loop/stream 统一编排）
+
+**Stage Exit Criteria:**
+- 北向端点 `/v1/chat/completions`、`/`、`/v1/models`、`/health` 行为等价
+- 观测口径 `x-request-id`、`end_reason`、`request.completed` 字段集合等价
+- 回归包 A/B/C 全绿后才允许进入下一阶段
+
+**Rollback Trigger During Refactor:**
+- 非 `client_abort` 口径下断流率或失败率超过阈值
+- tools 闭环成功率回落或回归包 B 失败
+- 任一触发项出现时停止推进并回退到上阶段基线版本
+
 **Cross-Component Dependencies:**
 - 会话 key 设计直接影响工具闭环连续性与灰度一致性
 - `end_reason` 口径影响监控告警、回滚触发与复盘效率
@@ -307,12 +323,14 @@ N/A（本项目为 API backend / adapter，无前端架构决策）
 - 服务层：SSE、tool-loop、session、upstream 交互
 - 基础设施层：redis、logger、config、auth middleware
 - 测试：按模块同级放置 `*.spec.js`（先从关键链路开始）
+- 迁移策略：`server.js` 采用“可运行优先”的增量抽离（先 config/middleware/routes，再 services，再 adapters）；每阶段必须保持行为等价并可回滚
 
 **File Structure Patterns:**
 - 配置读取统一从 `config/*`
 - 协议映射统一在 `adapters/*`
 - 归因与错误码映射统一在 `errors/*`
 - 禁止在多个模块重复实现相同脱敏逻辑
+- 等价性门槛：每次抽离后回归包 A/B/C 必须全绿，且 `x-request-id/end_reason` 观测口径不变
 
 ### Format Patterns
 
@@ -490,6 +508,7 @@ mix2api/
 - 北向契约边界：`/v1/chat/completions`、`/v1/models`、`/health`、`/`
 - 协议边界在 `controllers + adapters/openai`，禁止在路由层拼协议细节
 - 鉴权边界在 `middleware/auth-guard.middleware.js`
+- 跨层约束：routes 禁止直接访问 redis/upstream；controllers 禁止承载预算/tool-loop 业务状态机
 
 **Component Boundaries:**
 - 路由层：仅做入参分发

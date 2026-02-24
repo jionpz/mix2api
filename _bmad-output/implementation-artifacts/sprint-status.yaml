@@ -82,3 +82,11 @@ development_status:
   6-4-输出令牌参数映射与保护: done
   6-5-多模型上下文观测与回归矩阵: done
   epic-6-retrospective: done
+
+  epic-7: done
+  7-1-配置与通用工具抽离: done
+  7-2-中间件与路由入口抽离: done
+  7-3-会话与上游交互服务抽离: done
+  7-4-chat-编排状态机抽离: done
+  7-5-回归与等价性验收: done
+  epic-7-retrospective: done
