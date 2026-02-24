@@ -5,7 +5,7 @@
   "description": "OpenAI-compatible upstream adapter for new-api",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node src/server.js",
     "test": "node --test",
     "test:pack:a": "node --test --test-name-pattern \"stream=true|DONE|flushes first chunk|request.completed logs fixed dimensions\" tests/integration/chat-completions-auth-nonstream.test.js",
     "test:pack:b": "node --test --test-name-pattern \"forwards tools schema|legacy functions|tool_calls|tool backfill|MCP-safe\" tests/integration/chat-completions-auth-nonstream.test.js",

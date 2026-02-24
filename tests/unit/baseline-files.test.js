@@ -18,6 +18,10 @@ test('repo baseline files exist', () => {
     'package.json',
     'package-lock.json',
     'server.js',
+    'src/app.js',
+    'src/server.js',
+    'src/bootstrap/chat-handler.js',
+    'src/bootstrap/observability.js',
     'Dockerfile',
     'docker-compose.yml',
     '.env.example',
@@ -33,7 +37,7 @@ test('package.json has minimal start script', () => {
   const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
   assert.equal(pkg?.name, 'mix2api');
   assert.equal(pkg?.private, true);
-  assert.equal(pkg?.scripts?.start, 'node server.js');
+  assert.equal(pkg?.scripts?.start, 'node src/server.js');
 });
 
 test('.gitignore blocks .env files from being committed', () => {
