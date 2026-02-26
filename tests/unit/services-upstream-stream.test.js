@@ -51,14 +51,15 @@ test('startUpstreamStreamBridge writes chunks and DONE, sets stop end_reason', a
           object: 'chat.completion.chunk',
           created: 1,
           model,
-          choices: [{ index: 0, delta: { content: upstreamData.delta || '' }, finish_reason: null }]
+          choices: [{ index: 0, delta: { role: 'assistant', content: upstreamData.delta || '' }, finish_reason: null }]
         };
       }
       return null;
-    }
+    },
+    timeoutMs: 5000
   });
 
-  reader.emit('data', Buffer.from('data: {"type":"text-delta","delta":"hi"}\n'));
+  reader.emit('data', Buffer.from('data: {"type":"text-delta","delta":"hi"}\n\n'));
   reader.emit('end');
 
   assert.ok(writes.some((w) => w.includes('chat.completion.chunk')));
@@ -91,10 +92,11 @@ test('startUpstreamStreamBridge captures session id and stores it', async () => 
     redactSensitiveText: (s) => String(s || ''),
     fingerprint: () => 'fp',
     extractIdsFromUpstream: (data) => data.ids || null,
-    convertUpstreamToOpenAI: () => null
+    convertUpstreamToOpenAI: () => null,
+    timeoutMs: 5000
   });
 
-  reader.emit('data', Buffer.from('data: {"ids":{"sessionId":"sid-1","exchangeId":"eid-1"}}\n'));
+  reader.emit('data', Buffer.from('data: {"ids":{"sessionId":"sid-1","exchangeId":"eid-1"}}\n\n'));
   reader.emit('end');
 
   await new Promise((r) => setImmediate(r));

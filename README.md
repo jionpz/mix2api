@@ -67,6 +67,10 @@ curl -sS http://127.0.0.1:3001/v1/models
 - `REDIS_URL=redis://<host>:6379`
 - 可选 `REDIS_SESSION_PREFIX` 自定义前缀
 
+说明：
+- 默认 `UPSTREAM_AUTH_MODE=static`，避免意外透传入站凭据
+- 默认 `SESSION_STORE_MODE=auto`（未配置 `REDIS_URL` 时使用内存）
+
 会话引导规则（重要）：
 
 - 首次请求（当前会话键无缓存）时，`mix2api` 不会向上游透传客户端传入的 `session_id` / `exchange_id`。
@@ -177,6 +181,7 @@ OpenAPI 3.0 文档位于：
 - `/v1/models`
 - `/health`
 - 兼容错误响应（`error.message/type/code/param`）
+- `GET /health` 在会话存储降级时返回 `503` 且 `status=degraded`
 
 ## 7. 相关设计文档
 

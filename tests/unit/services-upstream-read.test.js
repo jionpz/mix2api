@@ -20,9 +20,9 @@ test('readUpstreamStream reads text-delta and captures ids', async () => {
   const reader = new EventEmitter();
   const response = { body: reader };
 
-  const promise = service.readUpstreamStream(response);
-  reader.emit('data', Buffer.from('data: {"ids":{"sessionId":"s1","exchangeId":"e1"}}\n'));
-  reader.emit('data', Buffer.from('data: {"type":"text-delta","delta":"hi"}\n'));
+  const promise = service.readUpstreamStream(response, { timeoutMs: 5000, requestId: 'r-stream', redactLine: (s) => s });
+  reader.emit('data', Buffer.from('data: {"ids":{"sessionId":"s1","exchangeId":"e1"}}\n\n'));
+  reader.emit('data', Buffer.from('data: {"type":"text-delta","delta":"hi"}\n\n'));
   reader.emit('end');
 
   const result = await promise;

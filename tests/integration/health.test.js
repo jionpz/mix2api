@@ -107,6 +107,8 @@ test('GET /health returns ok JSON and does not leak x-powered-by', async (t) => 
 
   const body = await res.json();
   assert.equal(body?.status, 'ok');
+  assert.equal(body?.service, 'mix2api');
+  assert.equal(body?.session_store?.degraded, false);
 
   const poweredBy = res.headers.get('x-powered-by');
   assert.ok(!poweredBy, `unexpected x-powered-by header: ${poweredBy}`);

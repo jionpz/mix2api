@@ -7,7 +7,10 @@ function createRequestLogMiddleware({ envBool, redactHeaders, maybeRecordSampleT
     if (logHeaders) {
       console.log(`[${new Date().toISOString()}] [${requestId}] headers=${JSON.stringify(redactHeaders(req.headers), null, 2)}`);
     }
-    res.on('finish', () => {
+    let logged = false;
+    const writeCompletedLog = () => {
+      if (logged) return;
+      logged = true;
       const durationMs = Date.now() - startedAt;
       const endReason = res.locals && res.locals.endReason ? res.locals.endReason : 'unknown';
       const upstreamStatus = res.locals && res.locals.upstreamStatus != null ? res.locals.upstreamStatus : 'none';
@@ -27,7 +30,10 @@ function createRequestLogMiddleware({ envBool, redactHeaders, maybeRecordSampleT
         `end_reason=${endReason} upstream_status=${upstreamStatus}`
       );
       maybeRecordSampleTrace(req, res, { durationMs, startedAt });
-    });
+    };
+
+    res.on('finish', writeCompletedLog);
+    res.on('close', writeCompletedLog);
     next();
   };
 }

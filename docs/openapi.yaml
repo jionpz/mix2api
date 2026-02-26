@@ -27,6 +27,20 @@ paths:
               example:
                 status: ok
                 service: mix2api
+        "503":
+          description: Service is running but degraded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: degraded
+                service: mix2api
+                session_store:
+                  mode: redis
+                  degraded: true
+                  connected: false
+                  reason: redis unavailable
 
   /v1/models:
     get:
@@ -204,7 +218,7 @@ paths:
                 invalid_messages:
                   value:
                     error:
-                      message: Invalid request: messages must be a non-empty array
+                      message: "Invalid request: messages must be a non-empty array"
                       type: invalid_request_error
                       code: invalid_request
                       param: messages
@@ -215,6 +229,18 @@ paths:
                       type: invalid_request_error
                       code: invalid_json
                       param: null
+        "413":
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  message: Request body too large
+                  type: invalid_request_error
+                  code: request_too_large
+                  param: null
         "401":
           description: Authentication failed
           content:
@@ -247,7 +273,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error:
-                  message: Upstream error: mocked upstream business error
+                  message: "Upstream error: mocked upstream business error"
                   type: api_error
                   code: upstream_error
                   param: null
@@ -259,7 +285,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 error:
-                  message: Upstream HTTP 503: mocked upstream failure
+                  message: "Upstream HTTP 503: mocked upstream failure"
                   type: api_error
                   code: upstream_http_error
                   param: null
@@ -284,10 +310,25 @@ components:
       properties:
         status:
           type: string
+          enum: [ok, degraded]
           example: ok
         service:
           type: string
           example: mix2api
+        session_store:
+          type: object
+          required: [mode, degraded, connected]
+          properties:
+            mode:
+              type: string
+              enum: [memory, redis]
+            degraded:
+              type: boolean
+            connected:
+              type: boolean
+            reason:
+              type: string
+              nullable: true
 
     Model:
       type: object

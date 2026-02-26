@@ -1735,6 +1735,7 @@ function convertUpstreamToOpenAI(upstreamData, model, id) {
       choices: [{
         index: 0,
         delta: {
+          role: 'assistant',
           content: upstreamData.delta || ''
         },
         finish_reason: null
@@ -1815,7 +1816,8 @@ function createApp() {
   registerCoreRoutes(app, {
     handleChatCompletion,
     resolveModelIds,
-    defaultModelIds: DEFAULT_MODEL_IDS
+    defaultModelIds: DEFAULT_MODEL_IDS,
+    sessionStoreService
   });
 
   return app;

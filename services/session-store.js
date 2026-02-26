@@ -25,8 +25,22 @@ function createSessionStoreService({
   let redisSessionDisabledReason = null;
   let redisSessionNextRetryAt = 0;
 
+  function getStoreHealth() {
+    const redisExpected = shouldUseRedisSessionStore();
+    const mode = redisExpected ? 'redis' : 'memory';
+    const degraded = redisExpected && (!redisSessionClient || Boolean(redisSessionDisabledReason));
+    return {
+      mode,
+      degraded,
+      reason: redisSessionDisabledReason,
+      connected: Boolean(redisSessionClient)
+    };
+  }
+
   function shouldUseRedisSessionStore() {
-    return SESSION_STORE_MODE === 'redis' || SESSION_STORE_MODE === 'auto';
+    if (SESSION_STORE_MODE === 'redis') return true;
+    if (SESSION_STORE_MODE === 'auto') return Boolean(REDIS_URL);
+    return false;
   }
 
   function redisSessionStoreKey(key) {
@@ -240,7 +254,8 @@ function createSessionStoreService({
     initRedisSessionClient,
     getStoredSession,
     updateStoredSession,
-    clearStoredSession
+    clearStoredSession,
+    getStoreHealth
   };
 }
 

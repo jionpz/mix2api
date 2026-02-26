@@ -19,7 +19,10 @@ test('registerCoreRoutes wires expected endpoints and handlers', () => {
   registerCoreRoutes(app, {
     handleChatCompletion: chatHandler,
     resolveModelIds: () => ['m1'],
-    defaultModelIds: ['d1']
+    defaultModelIds: ['d1'],
+    sessionStoreService: {
+      getStoreHealth: () => ({ mode: 'redis', degraded: false, reason: null, connected: true })
+    }
   });
 
   assert.deepEqual(posts.map((x) => x.path), ['/v1/chat/completions', '/']);

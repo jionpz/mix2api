@@ -25,7 +25,7 @@ function loadRuntimeConfig() {
     UPSTREAM_TOKEN_EXPIRY_SKEW_MS: envInt('UPSTREAM_TOKEN_EXPIRY_SKEW_MS', 60_000),
     UPSTREAM_AUTH_RECOVERY_RETRY: envInt('UPSTREAM_AUTH_RECOVERY_RETRY', 1),
     SESSION_SCHEMA_VERSION: 1,
-    SESSION_STORE_MODE: String(process.env.SESSION_STORE_MODE || 'redis').trim().toLowerCase(),
+    SESSION_STORE_MODE: String(process.env.SESSION_STORE_MODE || 'auto').trim().toLowerCase(),
     REDIS_URL: String(process.env.REDIS_URL || '').trim(),
     REDIS_CONNECT_TIMEOUT_MS: envInt('REDIS_CONNECT_TIMEOUT_MS', 2000),
     REDIS_SESSION_PREFIX: String(process.env.REDIS_SESSION_PREFIX || 'mix2api:session').trim(),

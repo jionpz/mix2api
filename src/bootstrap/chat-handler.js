@@ -39,7 +39,7 @@ function createChatHandler(deps) {
       const requestBody = req.body;
       const authHeader = req.headers.authorization;
       const inboundAuthMode = String(process.env.INBOUND_AUTH_MODE || 'bearer').toLowerCase();
-      const upstreamAuthMode = String(process.env.UPSTREAM_AUTH_MODE || 'pass_through').toLowerCase();
+      const upstreamAuthMode = String(process.env.UPSTREAM_AUTH_MODE || 'static').toLowerCase();
       const expectedInboundToken = process.env.INBOUND_BEARER_TOKEN || null;
       const staticUpstreamToken = process.env.UPSTREAM_BEARER_TOKEN || null;
 
@@ -200,14 +200,19 @@ function createChatHandler(deps) {
           redactSensitiveText,
           fingerprint,
           extractIdsFromUpstream,
-          convertUpstreamToOpenAI
+          convertUpstreamToOpenAI,
+          timeoutMs
         });
       } else {
         let text = '';
         let upstreamSessionId = null;
         let upstreamExchangeId = null;
         if (upstreamContentType.includes('text/event-stream')) {
-          const result = await upstreamReadService.readUpstreamStream(response);
+          const result = await upstreamReadService.readUpstreamStream(response, {
+            timeoutMs,
+            requestId,
+            redactLine: redactSensitiveText
+          });
           text = result.text;
           upstreamSessionId = result.sessionId || null;
           upstreamExchangeId = result.exchangeId || null;

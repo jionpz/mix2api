@@ -1,3 +1,5 @@
+const { createSseEventParser } = require('./sse-parser');
+
 function createUpstreamReadService({ helpers }) {
   const {
     extractIdsFromUpstream,
@@ -6,50 +8,85 @@ function createUpstreamReadService({ helpers }) {
     fingerprint
   } = helpers;
 
-  async function readUpstreamStream(response) {
+  async function readUpstreamStream(response, options = {}) {
+    const {
+      timeoutMs = 0,
+      requestId = 'unknown',
+      redactLine = null
+    } = options;
     return new Promise((resolve, reject) => {
       const reader = response.body;
-      let buffer = '';
       let text = '';
       let exchangeId = null;
       let sessionId = null;
+      let done = false;
+      let timeout = null;
 
-      reader.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
+      const clearTimer = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+      };
 
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let jsonData;
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
-              continue;
-            }
-            jsonData = data;
-          } else {
-            jsonData = line;
+      const resetTimer = () => {
+        clearTimer();
+        if (!Number.isFinite(Number(timeoutMs)) || Number(timeoutMs) <= 0) return;
+        timeout = setTimeout(() => {
+          if (done) return;
+          done = true;
+          if (reader && typeof reader.destroy === 'function' && !reader.destroyed) {
+            reader.destroy(new Error('stream timeout'));
           }
+          reject(new Error('stream timeout'));
+        }, Number(timeoutMs));
+        if (typeof timeout.unref === 'function') timeout.unref();
+      };
 
-          try {
-            const upstreamData = JSON.parse(jsonData);
-            if (!sessionId) {
-              const ids = extractIdsFromUpstream(upstreamData);
-              if (ids) {
-                exchangeId = ids.exchangeId || exchangeId;
-                sessionId = ids.sessionId || ids.exchangeId || sessionId;
-              }
+      const parser = createSseEventParser(({ data }) => {
+        if (!data || !data.trim()) return;
+        if (data === '[DONE]') return;
+
+        try {
+          const upstreamData = JSON.parse(data);
+          if (!sessionId) {
+            const ids = extractIdsFromUpstream(upstreamData);
+            if (ids) {
+              exchangeId = ids.exchangeId || exchangeId;
+              sessionId = ids.sessionId || ids.exchangeId || sessionId;
             }
-            if (upstreamData.type === 'text-delta' && upstreamData.delta) {
-              text += upstreamData.delta;
-            }
-          } catch {}
+          }
+          if (upstreamData.type === 'text-delta' && upstreamData.delta) {
+            text += upstreamData.delta;
+          }
+        } catch (error) {
+          if (typeof redactLine === 'function') {
+            const safeLine = String(redactLine(String(data || '')) || '').slice(0, 300);
+            console.warn(`[${requestId}] upstream stream parse skipped line=${safeLine}`);
+          }
         }
       });
 
-      reader.on('end', () => resolve({ text, sessionId, exchangeId }));
-      reader.on('error', (error) => reject(error));
+      resetTimer();
+
+      reader.on('data', (chunk) => {
+        resetTimer();
+        parser.push(chunk.toString());
+      });
+
+      reader.on('end', () => {
+        if (done) return;
+        done = true;
+        clearTimer();
+        parser.flush();
+        resolve({ text, sessionId, exchangeId });
+      });
+      reader.on('error', (error) => {
+        if (done) return;
+        done = true;
+        clearTimer();
+        reject(error);
+      });
     });
   }
 
