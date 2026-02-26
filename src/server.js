@@ -14,3 +14,7 @@ function startServer() {
 module.exports = {
   startServer
 };
+
+if (require.main === module) {
+  startServer();
+}
