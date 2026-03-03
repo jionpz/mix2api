@@ -26,6 +26,12 @@ cp .env.example .env
 - `UPSTREAM_CHAT_PATH`（默认 `/v2/chats`）
 - 依据部署策略选择鉴权模式（见下文）
 
+可选（动态北向地址覆盖）：
+
+- `UPSTREAM_DYNAMIC_BASE_ENABLED=true` 开启按请求覆盖上游 base
+- `UPSTREAM_BASE_ALLOWLIST`（逗号分隔域名）限制可访问上游
+- `UPSTREAM_BASE_ALLOW_HTTP` / `UPSTREAM_BASE_ALLOW_PRIVATE` 控制协议与私网策略（默认建议关闭）
+
 3. 启动：
 
 ```bash
@@ -44,6 +50,27 @@ curl -sS http://127.0.0.1:3001/v1/models
 ## 3. 与 new-api 集成
 
 在 new-api 控制台新增 OpenAI Compatible channel，`base_url` 指向 `mix2api`（容器内建议 `http://mix2api:3001`）。
+
+### 动态北向地址（new-api 按请求透传）
+
+当 `UPSTREAM_DYNAMIC_BASE_ENABLED=true` 时，可按请求指定上游 base：
+
+- Header：`x-upstream-base-url`（优先级最高）
+- Body：`upstream_base_url`
+- Body（兼容别名）：`upstream_api_base`
+
+优先级：`x-upstream-base-url` > `upstream_base_url` > `upstream_api_base` > `UPSTREAM_API_BASE`。
+
+安全策略（默认建议）：
+
+- 默认禁用动态覆盖（需显式开启）
+- 默认限制 HTTP（建议 `UPSTREAM_BASE_ALLOW_HTTP=false`）
+- 默认限制私网/回环地址（建议 `UPSTREAM_BASE_ALLOW_PRIVATE=false`）
+- 生产建议配置 `UPSTREAM_BASE_ALLOWLIST`
+
+鉴权注意：
+
+- 若 `UPSTREAM_AUTH_MODE=managed` 且使用动态覆盖，需显式配置 `UPSTREAM_TOKEN_URL`（避免 token 端点歧义）
 
 推荐配置（生产）：
 

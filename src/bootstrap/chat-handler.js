@@ -71,6 +71,29 @@ function createChatHandler(deps) {
       const modelProfile = requestContext.modelProfile;
       const outputBudgetBase = requestContext.outputBudgetBase;
       const clientWantsStream = requestContext.clientWantsStream;
+      const resolvedUpstreamBaseUrl = requestContext.resolvedUpstreamBaseUrl || null;
+      let resolvedUpstreamHost = null;
+      if (resolvedUpstreamBaseUrl) {
+        try {
+          const parsed = new URL(resolvedUpstreamBaseUrl);
+          resolvedUpstreamHost = String(parsed.hostname || '').toLowerCase() || null;
+        } catch {
+          resolvedUpstreamHost = null;
+        }
+      }
+      if (resolvedUpstreamHost) {
+        res.locals.upstreamHost = resolvedUpstreamHost;
+      }
+
+      if (upstreamAuthMode === 'managed' && resolvedUpstreamBaseUrl && !process.env.UPSTREAM_TOKEN_URL) {
+        setRequestEndReason(res, 'invalid_request');
+        return sendOpenAIError(res, 400, {
+          message: 'Dynamic upstream_base_url requires UPSTREAM_TOKEN_URL when UPSTREAM_AUTH_MODE=managed',
+          type: 'invalid_request_error',
+          code: 'invalid_request',
+          param: 'upstream_base_url'
+        });
+      }
 
       const upstreamAuth = await resolveUpstreamToken({
         upstreamAuthMode,
@@ -155,6 +178,7 @@ function createChatHandler(deps) {
       const upstreamCall = await upstreamRequestService.fetchWithAuthRecovery({
         requestId,
         upstreamRequest,
+        upstreamBaseUrl: resolvedUpstreamBaseUrl,
         upstreamToken,
         upstreamAuthMode,
         authRecoveryRetry: UPSTREAM_AUTH_RECOVERY_RETRY,

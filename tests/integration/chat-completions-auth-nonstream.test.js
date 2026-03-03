@@ -244,6 +244,49 @@ async function startMockUpstream(port, {
   return { server, requests };
 }
 
+async function startDynamicMockUpstream(port, label) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let bodyText = '';
+    req.on('data', (chunk) => {
+      bodyText += chunk.toString('utf8');
+    });
+    req.on('end', () => {
+      let parsedBody = null;
+      try {
+        parsedBody = bodyText ? JSON.parse(bodyText) : null;
+      } catch {
+        parsedBody = null;
+      }
+      requests.push({
+        method: req.method,
+        url: req.url,
+        headers: req.headers,
+        bodyText,
+        body: parsedBody
+      });
+
+      if (req.method === 'POST' && req.url === '/v2/chats') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          content: `upstream-${label}`,
+          messageMetadata: {
+            sessionId: `sess-${label}`,
+            exchangeId: `ex-${label}`
+          }
+        }));
+        return;
+      }
+
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+  });
+
+  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return { server, requests };
+}
+
 async function startMockUpstreamWithManagedAuth(port, {
   issuedTokens = ['managed-token'],
   invalidTokens = [],
@@ -2245,6 +2288,8 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for succ
   assert.match(logs, /request\.completed[^\n]*end_reason=stop/);
   assert.match(logs, /request\.completed[^\n]*http_status=200/);
   assert.match(logs, /request\.completed[^\n]*upstream_status=200/);
+  assert.match(logs, /request\.completed[^\n]*upstream_host=none/);
+  assert.match(logs, /request\.completed[^\n]*upstream_override=default/);
 });
 
 test('POST /v1/chat/completions request.completed logs fixed dimensions for upstream errors', async (t) => {
@@ -2286,6 +2331,232 @@ test('POST /v1/chat/completions request.completed logs fixed dimensions for upst
   assert.match(logs, /request\.completed[^\n]*end_reason=upstream_error/);
   assert.match(logs, /request\.completed[^\n]*http_status=503/);
   assert.match(logs, /request\.completed[^\n]*upstream_status=503/);
+  assert.match(logs, /request\.completed[^\n]*upstream_host=none/);
+  assert.match(logs, /request\.completed[^\n]*upstream_override=default/);
+});
+
+test('POST /v1/chat/completions supports dynamic upstream_base_url override via request body', async (t) => {
+  const upstreamPortA = await getFreePort();
+  const upstreamPortB = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServerA, requests: requestsA } = await startDynamicMockUpstream(upstreamPortA, 'a');
+  const { server: upstreamServerB, requests: requestsB } = await startDynamicMockUpstream(upstreamPortB, 'b');
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort: upstreamPortA,
+    collectLogs: true,
+    env: {
+      UPSTREAM_DYNAMIC_BASE_ENABLED: 'true',
+      UPSTREAM_BASE_ALLOW_HTTP: 'true',
+      UPSTREAM_BASE_ALLOW_PRIVATE: 'true'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServerA);
+    await closeServer(upstreamServerB);
+  });
+
+  const resOverride = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      upstream_base_url: `http://127.0.0.1:${upstreamPortB}`,
+      messages: [{ role: 'user', content: 'route-to-b' }]
+    })
+  });
+  assert.equal(resOverride.status, 200);
+  const jsonOverride = await resOverride.json();
+  assert.equal(jsonOverride.choices[0].message.content, 'upstream-b');
+
+  const resFallback = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'fallback-to-a' }]
+    })
+  });
+  assert.equal(resFallback.status, 200);
+  const jsonFallback = await resFallback.json();
+  assert.equal(jsonFallback.choices[0].message.content, 'upstream-a');
+
+  assert.equal(requestsB.length >= 1, true);
+  assert.equal(requestsA.length >= 1, true);
+
+  await sleep(80);
+  const logs = `${adapterProc.__stdout || ''}\n${adapterProc.__stderr || ''}`;
+  assert.match(logs, /request\.completed[^\n]*upstream_override=dynamic/);
+  assert.match(logs, /request\.completed[^\n]*upstream_host=127\.0\.0\.1/);
+});
+
+test('POST /v1/chat/completions supports dynamic upstream override via x-upstream-base-url header', async (t) => {
+  const upstreamPortA = await getFreePort();
+  const upstreamPortB = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServerA } = await startDynamicMockUpstream(upstreamPortA, 'a');
+  const { server: upstreamServerB, requests: requestsB } = await startDynamicMockUpstream(upstreamPortB, 'b');
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort: upstreamPortA,
+    env: {
+      UPSTREAM_DYNAMIC_BASE_ENABLED: 'true',
+      UPSTREAM_BASE_ALLOW_HTTP: 'true',
+      UPSTREAM_BASE_ALLOW_PRIVATE: 'true'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServerA);
+    await closeServer(upstreamServerB);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token',
+      'x-upstream-base-url': `http://127.0.0.1:${upstreamPortB}`
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      messages: [{ role: 'user', content: 'route-via-header' }]
+    })
+  });
+
+  assert.equal(res.status, 200);
+  const json = await res.json();
+  assert.equal(json.choices[0].message.content, 'upstream-b');
+  assert.equal(requestsB.length >= 1, true);
+});
+
+test('POST /v1/chat/completions rejects dynamic upstream override when feature flag disabled', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startDynamicMockUpstream(upstreamPort, 'a');
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      UPSTREAM_DYNAMIC_BASE_ENABLED: 'false',
+      UPSTREAM_BASE_ALLOW_HTTP: 'true',
+      UPSTREAM_BASE_ALLOW_PRIVATE: 'true'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      upstream_base_url: `http://127.0.0.1:${upstreamPort}`,
+      messages: [{ role: 'user', content: 'should-fail-flag-disabled' }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.param, 'upstream_base_url');
+});
+
+test('POST /v1/chat/completions rejects invalid dynamic upstream host by allowlist policy', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startDynamicMockUpstream(upstreamPort, 'a');
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      UPSTREAM_DYNAMIC_BASE_ENABLED: 'true',
+      UPSTREAM_BASE_ALLOW_HTTP: 'true',
+      UPSTREAM_BASE_ALLOW_PRIVATE: 'true',
+      UPSTREAM_BASE_ALLOWLIST: 'allowed.example'
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      upstream_base_url: 'https://blocked.example',
+      messages: [{ role: 'user', content: 'should-fail-allowlist' }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.param, 'upstream_base_url');
+});
+
+test('POST /v1/chat/completions rejects dynamic upstream in managed mode without UPSTREAM_TOKEN_URL', async (t) => {
+  const upstreamPort = await getFreePort();
+  const adapterPort = await getFreePort();
+  const { server: upstreamServer } = await startDynamicMockUpstream(upstreamPort, 'a');
+  const adapterProc = await startAdapter({
+    port: adapterPort,
+    upstreamPort,
+    env: {
+      UPSTREAM_DYNAMIC_BASE_ENABLED: 'true',
+      UPSTREAM_BASE_ALLOW_HTTP: 'true',
+      UPSTREAM_BASE_ALLOW_PRIVATE: 'true',
+      UPSTREAM_AUTH_MODE: 'managed',
+      UPSTREAM_TOKEN_URL: ''
+    }
+  });
+
+  t.after(async () => {
+    await stopProc(adapterProc);
+    await closeServer(upstreamServer);
+  });
+
+  const res = await fetch(`http://127.0.0.1:${adapterPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer inbound-test-token'
+    },
+    body: JSON.stringify({
+      model: 'mix/qwen-3-235b-instruct',
+      stream: false,
+      upstream_base_url: `http://127.0.0.1:${upstreamPort}`,
+      messages: [{ role: 'user', content: 'managed-should-reject-without-token-url' }]
+    })
+  });
+
+  assert.equal(res.status, 400);
+  const json = await res.json();
+  assert.equal(json?.error?.param, 'upstream_base_url');
 });
 
 test('POST /v1/chat/completions emits budget observation logs with model-level fields and request_id trace for small/large model matrix', async (t) => {

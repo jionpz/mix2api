@@ -16,6 +16,8 @@ function createRequestIdMiddleware({ normalizeRequestId, uuidv4 }) {
     res.locals.outputBudget = 'none';
     res.locals.truncationApplied = 'false';
     res.locals.rejectReason = 'none';
+    res.locals.upstreamHost = 'none';
+    res.locals.upstreamOverride = 'default';
     res.setHeader('x-request-id', requestId);
     next();
   };

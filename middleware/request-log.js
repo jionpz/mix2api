@@ -22,12 +22,14 @@ function createRequestLogMiddleware({ envBool, redactHeaders, maybeRecordSampleT
       const outputBudget = res.locals && res.locals.outputBudget != null ? res.locals.outputBudget : 'none';
       const truncationApplied = res.locals && res.locals.truncationApplied != null ? res.locals.truncationApplied : 'false';
       const rejectReason = res.locals && res.locals.rejectReason != null ? res.locals.rejectReason : 'none';
+      const upstreamHost = res.locals && res.locals.upstreamHost != null ? res.locals.upstreamHost : 'none';
+      const upstreamOverride = res.locals && res.locals.upstreamOverride != null ? res.locals.upstreamOverride : 'default';
       console.log(
         `[${new Date().toISOString()}] [${requestId}] request.completed ` +
         `http_status=${res.statusCode} duration_ms=${durationMs} client=${client} stream=${stream} tools_present=${toolsPresent} ` +
         `model=${model} input_budget=${inputBudget} output_budget=${outputBudget} ` +
         `truncation_applied=${truncationApplied} reject_reason=${rejectReason} ` +
-        `end_reason=${endReason} upstream_status=${upstreamStatus}`
+        `end_reason=${endReason} upstream_status=${upstreamStatus} upstream_host=${upstreamHost} upstream_override=${upstreamOverride}`
       );
       maybeRecordSampleTrace(req, res, { durationMs, startedAt });
     };

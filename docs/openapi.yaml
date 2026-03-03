@@ -84,6 +84,17 @@ paths:
           schema:
             type: string
           description: Optional request correlation id. Invalid value will be regenerated.
+        - in: header
+          name: x-upstream-base-url
+          required: false
+          schema:
+            type: string
+            format: uri
+          description: |
+            Optional per-request upstream base URL override.
+            Effective only when server policy enables dynamic upstream routing.
+            Header value has higher priority than request body override fields.
+            When dynamic routing is disabled (UPSTREAM_DYNAMIC_BASE_ENABLED=false), requests using this field are rejected with 400 invalid_request_error.
       requestBody:
         required: true
         content:
@@ -444,6 +455,19 @@ components:
           description: |
             Optional exchange id for established conversations.
             For bootstrap requests (no stored mapping), adapter ignores client-provided exchange_id.
+        upstream_base_url:
+          type: string
+          format: uri
+          description: |
+            Optional per-request upstream base URL override.
+            Effective only when server policy enables dynamic upstream routing.
+            If absent, adapter uses static UPSTREAM_API_BASE.
+            When dynamic routing is disabled (UPSTREAM_DYNAMIC_BASE_ENABLED=false), requests using this field are rejected with 400 invalid_request_error.
+        upstream_api_base:
+          type: string
+          format: uri
+          deprecated: true
+          description: Deprecated alias of upstream_base_url.
         tools:
           type: array
           items:

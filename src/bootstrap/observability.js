@@ -66,6 +66,8 @@ function createObservability({ uuidv4, fingerprint, config }) {
       endReason: res && res.locals && res.locals.endReason ? String(res.locals.endReason) : 'unknown',
       httpStatus: res && Number.isFinite(Number(res.statusCode)) ? Number(res.statusCode) : 0,
       upstreamStatus: res && res.locals && res.locals.upstreamStatus != null ? String(res.locals.upstreamStatus) : 'none',
+      upstreamHost: res && res.locals && res.locals.upstreamHost != null ? String(res.locals.upstreamHost) : 'none',
+      upstreamOverride: res && res.locals && res.locals.upstreamOverride != null ? String(res.locals.upstreamOverride) : 'default',
       durationMs: meta && Number.isFinite(Number(meta.durationMs)) ? Number(meta.durationMs) : 0,
       requestSummary: {
         model: typeof body.model === 'string' ? body.model : null,
